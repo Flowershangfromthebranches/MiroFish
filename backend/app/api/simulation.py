@@ -20,6 +20,11 @@ from ..models.project import ProjectManager
 logger = get_logger('mirofish.api.simulation')
 
 
+def _legacy_zep_required() -> bool:
+    graph_provider = os.environ.get('MIROFISH_GRAPH_PROVIDER', Config.MIROFISH_GRAPH_PROVIDER)
+    return graph_provider == 'zep' and not Config.ZEP_API_KEY
+
+
 # Interview prompt 优化前缀
 # 添加此前缀可以避免Agent调用工具，直接用文本回复
 INTERVIEW_PROMPT_PREFIX = "结合你的人设、所有的过往记忆与行动，不调用任何工具直接用文本回复我："
@@ -57,7 +62,7 @@ def get_graph_entities(graph_id: str):
         enrich: 是否获取相关边信息（默认true）
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if _legacy_zep_required():
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
@@ -94,7 +99,7 @@ def get_graph_entities(graph_id: str):
 def get_entity_detail(graph_id: str, entity_uuid: str):
     """获取单个实体的详细信息"""
     try:
-        if not Config.ZEP_API_KEY:
+        if _legacy_zep_required():
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
@@ -127,7 +132,7 @@ def get_entity_detail(graph_id: str, entity_uuid: str):
 def get_entities_by_type(graph_id: str, entity_type: str):
     """获取指定类型的所有实体"""
     try:
-        if not Config.ZEP_API_KEY:
+        if _legacy_zep_required():
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
@@ -1547,7 +1552,11 @@ def start_simulation():
                 if state.status == SimulationStatus.RUNNING:
                     # 检查模拟进程是否真的在运行
                     run_state = SimulationRunner.get_run_state(simulation_id)
-                    if run_state and run_state.runner_status.value == "running":
+                    if (
+                        run_state
+                        and run_state.runner_status.value == "running"
+                        and SimulationRunner.is_process_alive(simulation_id)
+                    ):
                         # 进程确实在运行
                         if force:
                             # 强制模式：停止运行中的模拟

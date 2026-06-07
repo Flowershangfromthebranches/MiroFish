@@ -1,18 +1,21 @@
-"""
-LLM客户端封装
-统一使用OpenAI格式调用
-"""
+"""Legacy LLMClient facade backed by AgentRuntime."""
 
 import json
 import re
+from pathlib import Path
 from typing import Optional, Dict, Any, List
-from openai import OpenAI
 
 from ..config import Config
+from ..adapters.llm.agent_runtime import AgentRuntime, NeedAgentResponse
+from ..agent_engine.json_schema import object_schema
 
 
 class LLMClient:
-    """LLM客户端"""
+    """Compatibility wrapper for older services.
+
+    New business code should call AgentRuntime directly. This class remains so
+    legacy UI/report code can be migrated incrementally without direct SDK use.
+    """
     
     def __init__(
         self,
@@ -20,17 +23,12 @@ class LLMClient:
         base_url: Optional[str] = None,
         model: Optional[str] = None
     ):
-        self.api_key = api_key or Config.LLM_API_KEY
+        self.api_key = api_key
         self.base_url = base_url or Config.LLM_BASE_URL
         self.model = model or Config.LLM_MODEL_NAME
-        
-        if not self.api_key:
-            raise ValueError("LLM_API_KEY 未配置")
-        
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        legacy_run_dir = Path(Config.MIROFISH_RUNS_DIR) / "legacy-ui"
+        legacy_run_dir.mkdir(parents=True, exist_ok=True)
+        self.runtime = AgentRuntime(run_dir=str(legacy_run_dir))
     
     def chat(
         self,
@@ -51,18 +49,35 @@ class LLMClient:
         Returns:
             模型响应文本
         """
-        kwargs = {
-            "model": self.model,
+        if response_format and response_format.get("type") == "json_object":
+            max_tokens = max(max_tokens, 8192)
+
+        structured_input = {
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "response_format": response_format,
+            "legacy_client": True,
         }
-        
-        if response_format:
-            kwargs["response_format"] = response_format
-        
-        response = self.client.chat.completions.create(**kwargs)
-        content = response.choices[0].message.content
+        user_prompt = "\n".join(message.get("content", "") for message in messages if message.get("role") == "user")
+        system_prompt = "\n".join(message.get("content", "") for message in messages if message.get("role") == "system")
+        result = self.runtime.run_task(
+            run_id="legacy-ui",
+            task_type="validate_json_output" if response_format else "answer_followup_question",
+            stage="legacy_llm_client",
+            expected_schema=object_schema({"text": {"type": "string"}}, ["text"]),
+            structured_input=structured_input,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+        if result.status == "need_agent_response":
+            raise NeedAgentResponse(result)
+        if result.status != "ok":
+            raise RuntimeError(result.error or "LLM provider failed")
+        content = (result.output or {}).get("text")
+        if content is None and result.output:
+            content = json.dumps(result.output, ensure_ascii=False)
+        content = content or ""
         # 部分模型（如MiniMax M2.5）会在content中包含<think>思考内容，需要移除
         content = re.sub(r'<think>[\s\S]*?</think>', '', content).strip()
         return content
@@ -84,12 +99,31 @@ class LLMClient:
         Returns:
             解析后的JSON对象
         """
-        response = self.chat(
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"}
+        structured_input = {
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "legacy_client": True,
+        }
+        user_prompt = "\n".join(message.get("content", "") for message in messages if message.get("role") == "user")
+        system_prompt = "\n".join(message.get("content", "") for message in messages if message.get("role") == "system")
+        result = self.runtime.run_task(
+            run_id="legacy-ui",
+            task_type="validate_json_output",
+            stage="legacy_llm_client",
+            expected_schema={"type": "object"},
+            structured_input=structured_input,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
         )
+        if result.status == "need_agent_response":
+            raise NeedAgentResponse(result)
+        if result.status != "ok":
+            raise RuntimeError(result.error or "LLM provider failed")
+        if isinstance(result.output, dict):
+            return result.output
+        response = json.dumps(result.output, ensure_ascii=False)
         # 清理markdown代码块标记
         cleaned_response = response.strip()
         cleaned_response = re.sub(r'^```(?:json)?\s*\n?', '', cleaned_response, flags=re.IGNORECASE)
@@ -100,4 +134,3 @@ class LLMClient:
             return json.loads(cleaned_response)
         except json.JSONDecodeError:
             raise ValueError(f"LLM返回的JSON格式无效: {cleaned_response}")
-

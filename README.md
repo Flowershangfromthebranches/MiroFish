@@ -93,6 +93,26 @@ Click the image to watch MiroFish's deep prediction of the lost ending based on 
 
 ## 🚀 Quick Start
 
+### Agent Engine Mode
+
+MiroFish now supports CLI/MCP-driven agent mode. In this mode desktop agents process model tasks through request/response files, so `LLM_API_KEY`, `OPENAI_API_KEY`, and `ZEP_API_KEY` are not required.
+
+See [AGENT_KIT.md](./AGENT_KIT.md), [docs/agent-usage/codex.md](./docs/agent-usage/codex.md), and [docs/agent-usage/mcp.md](./docs/agent-usage/mcp.md).
+
+Install agent engine dependencies from the backend when using CLI/MCP mode:
+
+```bash
+cd backend
+uv sync --extra agent --group dev
+```
+
+Legacy OpenAI-compatible and Zep Cloud SDKs are optional:
+
+```bash
+cd backend
+uv sync --extra legacy
+```
+
 ### Option 1: Source Code Deployment (Recommended)
 
 #### Prerequisites
@@ -109,10 +129,30 @@ Click the image to watch MiroFish's deep prediction of the lost ending based on 
 # Copy the example configuration file
 cp .env.example .env
 
-# Edit the .env file and fill in the required API keys
+# Edit the .env file. Agent mode does not require model or Zep API keys.
 ```
 
-**Required Environment Variables:**
+**Default Agent Environment Variables:**
+
+```env
+MIROFISH_MODE=agent
+MIROFISH_LLM_PROVIDER=agent_queue
+MIROFISH_GRAPH_PROVIDER=graphiti
+MIROFISH_RUNS_DIR=./runs
+
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=password
+NEO4J_DATABASE=neo4j
+
+MIROFISH_GRAPH_SEARCH_MODE=fulltext
+MIROFISH_EMBEDDING_PROVIDER=none
+```
+
+**Legacy Compatibility Variables:**
+
+These are required only when explicitly using `MIROFISH_LLM_PROVIDER=openai_compatible` or `MIROFISH_GRAPH_PROVIDER=zep`.
+Install the optional legacy SDKs with `uv sync --extra legacy`.
 
 ```env
 # LLM API Configuration (supports any LLM API with OpenAI SDK format)

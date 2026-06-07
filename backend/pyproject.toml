@@ -13,12 +13,6 @@ dependencies = [
     "flask>=3.0.0",
     "flask-cors>=6.0.0",
     
-    # LLM 相关
-    "openai>=1.0.0",
-    
-    # Zep Cloud
-    "zep-cloud==3.13.0",
-    
     # OASIS 社交媒体模拟
     "camel-oasis==0.2.5",
     "camel-ai==0.2.78",
@@ -34,7 +28,20 @@ dependencies = [
     "pydantic>=2.0.0",
 ]
 
+[project.scripts]
+mirofish-agent = "app.agent_engine.cli:main"
+mirofish-mcp = "app.mcp_server.server:main"
+
 [project.optional-dependencies]
+agent = [
+    "graphiti-core",
+    "neo4j",
+    "mcp",
+]
+legacy = [
+    "openai>=1.0.0",
+    "zep-cloud==3.13.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

@@ -333,7 +333,11 @@ class SimulationRunner:
         """
         # 检查是否已在运行
         existing = cls.get_run_state(simulation_id)
-        if existing and existing.runner_status in [RunnerStatus.RUNNING, RunnerStatus.STARTING]:
+        if (
+            existing
+            and existing.runner_status in [RunnerStatus.RUNNING, RunnerStatus.STARTING]
+            and cls.is_process_alive(simulation_id)
+        ):
             raise ValueError(f"模拟已在运行中: {simulation_id}")
         
         # 加载模拟配置
@@ -1182,6 +1186,7 @@ class SimulationRunner:
     
     # 防止重复清理的标志
     _cleanup_done = False
+    _skip_exit_cleanup = False
     
     @classmethod
     def cleanup_all_simulations(cls):
@@ -1190,6 +1195,10 @@ class SimulationRunner:
         
         在服务器关闭时调用，确保所有子进程被终止
         """
+        if cls._skip_exit_cleanup:
+            logger.info("跳过模拟进程清理：开发模式下保留等待命令模式的模拟进程")
+            return
+
         # 防止重复清理
         if cls._cleanup_done:
             return
@@ -1318,6 +1327,27 @@ class SimulationRunner:
         
         def cleanup_handler(signum=None, frame=None):
             """信号处理器：先清理模拟进程，再调用原处理器"""
+            preserve_on_reload = (
+                Config.DEBUG
+                and Config.PRESERVE_SIMULATIONS_ON_RELOAD
+                and signum in {signal.SIGTERM, getattr(signal, 'SIGHUP', None)}
+            )
+            if preserve_on_reload:
+                cls._skip_exit_cleanup = True
+                if cls._processes or cls._graph_memory_enabled:
+                    logger.info(
+                        f"收到信号 {signum}，开发模式下保留模拟进程；"
+                        "请使用 /api/simulation/stop 或 /api/simulation/close-env 显式停止"
+                    )
+
+                if signum == signal.SIGTERM and callable(original_sigterm):
+                    original_sigterm(signum, frame)
+                    return
+                if has_sighup and signum == signal.SIGHUP and callable(original_sighup):
+                    original_sighup(signum, frame)
+                    return
+                sys.exit(0)
+
             # 只有在有进程需要清理时才打印日志
             if cls._processes or cls._graph_memory_enabled:
                 logger.info(f"收到信号 {signum}，开始清理...")
@@ -1367,6 +1397,24 @@ class SimulationRunner:
             if process.poll() is None:
                 running.append(sim_id)
         return running
+
+    @classmethod
+    def is_process_alive(cls, simulation_id: str) -> bool:
+        """检查模拟子进程是否仍然存在。"""
+        process = cls._processes.get(simulation_id)
+        if process:
+            return process.poll() is None
+
+        state = cls.get_run_state(simulation_id)
+        pid = state.process_pid if state else None
+        if not pid:
+            return False
+
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
     
     # ============== Interview 功能 ==============
     
@@ -1383,6 +1431,9 @@ class SimulationRunner:
         """
         sim_dir = os.path.join(cls.RUN_STATE_DIR, simulation_id)
         if not os.path.exists(sim_dir):
+            return False
+
+        if not cls.is_process_alive(simulation_id):
             return False
 
         ipc_client = SimulationIPCClient(sim_dir)
@@ -1765,4 +1816,3 @@ class SimulationRunner:
             results = results[:limit]
         
         return results
-

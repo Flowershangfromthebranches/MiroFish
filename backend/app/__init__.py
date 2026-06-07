@@ -9,10 +9,11 @@ import warnings
 # 需要在所有其他导入之前设置
 warnings.filterwarnings("ignore", message=".*resource_tracker.*")
 
-from flask import Flask, request
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from .config import Config
+from .adapters.llm.agent_runtime import NeedAgentResponse
 from .utils.logger import setup_logger, get_logger
 
 
@@ -61,6 +62,11 @@ def create_app(config_class=Config):
         logger = get_logger('mirofish.request')
         logger.debug(f"响应: {response.status_code}")
         return response
+
+    @app.errorhandler(NeedAgentResponse)
+    def handle_need_agent_response(error):
+        """Expose agent_queue waits as structured API responses instead of 500s."""
+        return jsonify(error.result.to_dict()), 202
     
     # 注册蓝图
     from .api import graph_bp, simulation_bp, report_bp
@@ -77,4 +83,3 @@ def create_app(config_class=Config):
         logger.info("MiroFish Backend 启动完成")
     
     return app
-

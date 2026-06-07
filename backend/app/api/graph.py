@@ -23,6 +23,14 @@ from ..models.project import ProjectManager, ProjectStatus
 logger = get_logger('mirofish.api')
 
 
+def _legacy_zep_config_errors() -> list[str]:
+    """Only legacy zep provider requires ZEP_API_KEY."""
+    graph_provider = os.environ.get('MIROFISH_GRAPH_PROVIDER', Config.MIROFISH_GRAPH_PROVIDER)
+    if graph_provider == 'zep' and not Config.ZEP_API_KEY:
+        return [t('api.zepApiKeyMissing')]
+    return []
+
+
 def allowed_file(filename: str) -> bool:
     """检查文件扩展名是否允许"""
     if not filename or '.' not in filename:
@@ -248,6 +256,7 @@ def generate_ontology():
         })
         
     except Exception as e:
+        logger.exception("生成本体定义失败")
         return jsonify({
             "success": False,
             "error": str(e),
@@ -284,9 +293,7 @@ def build_graph():
         logger.info("=== 开始构建图谱 ===")
         
         # 检查配置
-        errors = []
-        if not Config.ZEP_API_KEY:
-            errors.append(t('api.zepApiKeyMissing'))
+        errors = _legacy_zep_config_errors()
         if errors:
             logger.error(f"配置错误: {errors}")
             return jsonify({
@@ -387,7 +394,7 @@ def build_graph():
                 )
                 
                 # 创建图谱构建服务
-                builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+                builder = GraphBuilderService()
                 
                 # 分块
                 task_manager.update_task(
@@ -522,6 +529,7 @@ def build_graph():
         })
         
     except Exception as e:
+        logger.exception(f"获取图谱数据失败: graph_id={graph_id}")
         return jsonify({
             "success": False,
             "error": str(e),
@@ -572,13 +580,13 @@ def get_graph_data(graph_id: str):
     获取图谱数据（节点和边）
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if _legacy_zep_config_errors():
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
             }), 500
         
-        builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+        builder = GraphBuilderService()
         graph_data = builder.get_graph_data(graph_id)
         
         return jsonify({
@@ -600,13 +608,13 @@ def delete_graph(graph_id: str):
     删除Zep图谱
     """
     try:
-        if not Config.ZEP_API_KEY:
+        if _legacy_zep_config_errors():
             return jsonify({
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
             }), 500
         
-        builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+        builder = GraphBuilderService()
         builder.delete_graph(graph_id)
         
         return jsonify({

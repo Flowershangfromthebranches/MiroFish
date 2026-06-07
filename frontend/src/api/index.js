@@ -1,6 +1,22 @@
 import axios from 'axios'
 import i18n from '../i18n'
 
+const getResponseErrorMessage = (error) => {
+  const data = error?.response?.data
+  if (data?.error) return data.error
+  if (data?.message) return data.message
+  if (typeof data === 'string') return data
+  return error?.message || 'Error'
+}
+
+const normalizeApiError = (error) => {
+  const normalized = new Error(getResponseErrorMessage(error))
+  normalized.status = error?.response?.status
+  normalized.data = error?.response?.data
+  normalized.originalError = error
+  return normalized
+}
+
 // 创建axios实例
 const service = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:5001',
@@ -48,7 +64,7 @@ service.interceptors.response.use(
       console.error('Network error - please check your connection')
     }
     
-    return Promise.reject(error)
+    return Promise.reject(normalizeApiError(error))
   }
 )
 
@@ -58,6 +74,10 @@ export const requestWithRetry = async (requestFn, maxRetries = 3, delay = 1000) 
     try {
       return await requestFn()
     } catch (error) {
+      if (error.status >= 400 && error.status < 500) {
+        throw error
+      }
+
       if (i === maxRetries - 1) throw error
       
       console.warn(`Request failed, retrying (${i + 1}/${maxRetries})...`)

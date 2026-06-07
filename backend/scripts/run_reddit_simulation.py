@@ -36,7 +36,7 @@ _project_root = os.path.abspath(os.path.join(_backend_dir, '..'))
 sys.path.insert(0, _scripts_dir)
 sys.path.insert(0, _backend_dir)
 
-# 加载项目根目录的 .env 文件（包含 LLM_API_KEY 等配置）
+# 加载项目根目录的 .env 文件（包含 MiroFish provider 配置）
 from dotenv import load_dotenv
 _env_file = os.path.join(_project_root, '.env')
 if os.path.exists(_env_file):
@@ -116,8 +116,7 @@ def setup_oasis_logging(log_dir: str):
 
 
 try:
-    from camel.models import ModelFactory
-    from camel.types import ModelPlatformType
+    from app.adapters.llm.camel_adapter import create_model_backend
     import oasis
     from oasis import (
         ActionType,
@@ -435,36 +434,13 @@ class RedditSimulationRunner:
         """
         创建LLM模型
         
-        统一使用项目根目录 .env 文件中的配置（优先级最高）：
-        - LLM_API_KEY: API密钥
-        - LLM_BASE_URL: API基础URL
-        - LLM_MODEL_NAME: 模型名称
+        统一使用 AgentRuntime / LLMProvider 配置（优先级最高）：
+        - MIROFISH_LLM_PROVIDER=agent_queue 时不需要模型 API key
+        - MIROFISH_LLM_PROVIDER=openai_compatible 时使用 legacy LLM_* 配置
         """
-        # 优先从 .env 读取配置
-        llm_api_key = os.environ.get("LLM_API_KEY", "")
-        llm_base_url = os.environ.get("LLM_BASE_URL", "")
-        llm_model = os.environ.get("LLM_MODEL_NAME", "")
-        
-        # 如果 .env 中没有，则使用 config 作为备用
-        if not llm_model:
-            llm_model = self.config.get("llm_model", "gpt-4o-mini")
-        
-        # 设置 camel-ai 所需的环境变量
-        if llm_api_key:
-            os.environ["OPENAI_API_KEY"] = llm_api_key
-        
-        if not os.environ.get("OPENAI_API_KEY"):
-            raise ValueError("缺少 API Key 配置，请在项目根目录 .env 文件中设置 LLM_API_KEY")
-        
-        if llm_base_url:
-            os.environ["OPENAI_API_BASE_URL"] = llm_base_url
-        
-        print(f"LLM配置: model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else '默认'}...")
-        
-        return ModelFactory.create(
-            model_platform=ModelPlatformType.OPENAI,
-            model_type=llm_model,
-        )
+        run_id = self.config.get("simulation_id") or os.path.basename(self.simulation_dir)
+        print(f"LLM配置: AgentRuntime adapter, run_id={run_id}")
+        return create_model_backend(run_id=run_id, run_dir=self.simulation_dir)
     
     def _get_active_agents_for_round(
         self, 
@@ -766,4 +742,3 @@ if __name__ == "__main__":
         pass
     finally:
         print("模拟进程已退出")
-

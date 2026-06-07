@@ -23,6 +23,22 @@ class Config:
     # Flask配置
     SECRET_KEY = os.environ.get('SECRET_KEY', 'mirofish-secret-key')
     DEBUG = os.environ.get('FLASK_DEBUG', 'True').lower() == 'true'
+    PRESERVE_SIMULATIONS_ON_RELOAD = os.environ.get(
+        'MIROFISH_PRESERVE_SIMULATIONS_ON_RELOAD',
+        'true' if DEBUG else 'false'
+    ).lower() == 'true'
+
+    # Agent engine配置
+    MIROFISH_MODE = os.environ.get('MIROFISH_MODE', 'agent')
+    MIROFISH_LLM_PROVIDER = os.environ.get(
+        'MIROFISH_LLM_PROVIDER',
+        'agent_queue' if MIROFISH_MODE == 'agent' else 'openai_compatible'
+    )
+    MIROFISH_GRAPH_PROVIDER = os.environ.get(
+        'MIROFISH_GRAPH_PROVIDER',
+        'graphiti' if MIROFISH_MODE == 'agent' else 'zep'
+    )
+    MIROFISH_RUNS_DIR = os.environ.get('MIROFISH_RUNS_DIR', './runs')
     
     # JSON配置 - 禁用ASCII转义，让中文直接显示（而不是 \uXXXX 格式）
     JSON_AS_ASCII = False
@@ -34,6 +50,14 @@ class Config:
     
     # Zep配置
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
+
+    # Graphiti / Neo4j配置
+    NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+    NEO4J_USER = os.environ.get('NEO4J_USER', 'neo4j')
+    NEO4J_PASSWORD = os.environ.get('NEO4J_PASSWORD', 'password')
+    NEO4J_DATABASE = os.environ.get('NEO4J_DATABASE', 'neo4j')
+    OLLAMA_BASE_URL = os.environ.get('OLLAMA_BASE_URL', 'http://localhost:11434')
+    OLLAMA_EMBEDDING_MODEL = os.environ.get('OLLAMA_EMBEDDING_MODEL', 'nomic-embed-text')
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
@@ -67,9 +91,18 @@ class Config:
     def validate(cls) -> list[str]:
         """验证必要配置"""
         errors: list[str] = []
-        if not cls.LLM_API_KEY:
-            errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
-        return errors
+        mode = os.environ.get('MIROFISH_MODE', cls.MIROFISH_MODE)
+        llm_provider = os.environ.get(
+            'MIROFISH_LLM_PROVIDER',
+            'agent_queue' if mode == 'agent' else cls.MIROFISH_LLM_PROVIDER
+        )
+        graph_provider = os.environ.get(
+            'MIROFISH_GRAPH_PROVIDER',
+            'graphiti' if mode == 'agent' else cls.MIROFISH_GRAPH_PROVIDER
+        )
 
+        if llm_provider == 'openai_compatible' and not os.environ.get('LLM_API_KEY', cls.LLM_API_KEY or ''):
+            errors.append("LLM_API_KEY 未配置（openai_compatible provider 需要）")
+        if graph_provider == 'zep' and not os.environ.get('ZEP_API_KEY', cls.ZEP_API_KEY or ''):
+            errors.append("ZEP_API_KEY 未配置（legacy zep provider 需要）")
+        return errors

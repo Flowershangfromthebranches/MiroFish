@@ -12,9 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from queue import Queue, Empty
 
-from zep_cloud.client import Zep
-
 from ..config import Config
+from ..adapters.graph.factory import create_graph_provider
 from ..utils.logger import get_logger
 from ..utils.locale import get_locale, set_locale
 
@@ -235,15 +234,11 @@ class ZepGraphMemoryUpdater:
         
         Args:
             graph_id: Zep图谱ID
-            api_key: Zep API Key（可选，默认从配置读取）
+            api_key: legacy Zep API Key（仅由 legacy provider 使用）
         """
         self.graph_id = graph_id
-        self.api_key = api_key or Config.ZEP_API_KEY
-        
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self.api_key = api_key
+        self.provider = create_graph_provider()
         
         # 活动队列
         self._activity_queue: Queue = Queue()
@@ -411,10 +406,10 @@ class ZepGraphMemoryUpdater:
         # 带重试的发送
         for attempt in range(self.MAX_RETRIES):
             try:
-                self.client.graph.add(
-                    graph_id=self.graph_id,
-                    type="text",
-                    data=combined_text
+                self.provider.add_episode(
+                    self.graph_id,
+                    combined_text,
+                    {"platform": platform, "source": "simulation_activity"},
                 )
                 
                 self._total_sent += 1

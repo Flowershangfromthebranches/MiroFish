@@ -145,7 +145,7 @@ Latest local verification:
 
 ```bash
 cd /Users/leaf/Documents/future/MiroFish/backend && uv run pytest -q
-# 87 passed, 639 warnings
+# 98 passed, 690 warnings
 
 cd /Users/leaf/Documents/future/MiroFish && bash scripts/smoke_agent_queue_full.sh
 # CLI full agent_queue smoke passed, including follow-up Q&A

@@ -17,7 +17,7 @@ from app.agent_engine.contracts import (
 )
 from app.agent_engine.json_schema import validate_json_schema
 from app.agent_engine.queue import AgentQueue
-from app.agent_engine.runner import PredictionRunService
+from app.agent_engine.runner import PredictionRunService, _resolve_agent_id
 from app.agent_engine.schemas import AGENT_TASK_TYPES
 from app.agent_engine.state import RunStore
 
@@ -660,3 +660,115 @@ class TestMCPQuestionnaireJsonParam:
             assert False, "Should have raised"
         except (ValueError, TypeError):
             pass  # Expected
+
+
+# ── Profile ID fallback tests ────────────────────────────────────────────
+
+def _init_run_no_agent_id(tmp_path: Path) -> tuple[Path, PredictionRunService]:
+    """Create a run with profiles that have NO agent_id or user_id — only name."""
+    seed = tmp_path / "seed.md"
+    seed.write_text("Seed.", encoding="utf-8")
+    run_dir = tmp_path / "run_noid"
+    service = PredictionRunService()
+    service.create_run(str(seed), "test fallback id", str(run_dir))
+    profiles = [
+        {"name": "Baidu", "type": "search", "description": "Chinese search engine."},
+        {"name": "Google China", "type": "search", "description": "Google's China ops."},
+        {"name": "Baidu", "type": "ai", "description": "Duplicate name, different type."},
+        {"type": "anon", "description": "No name at all."},
+    ]
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    (artifacts_dir / "profiles.json").write_text(json.dumps(profiles), encoding="utf-8")
+    (artifacts_dir / "report.md").write_text("# Report", encoding="utf-8")
+    (artifacts_dir / "verdict.json").write_text("{}", encoding="utf-8")
+    (artifacts_dir / "timeline.json").write_text("[]", encoding="utf-8")
+    (artifacts_dir / "graph_snapshot.json").write_text("[]", encoding="utf-8")
+    (artifacts_dir / "simulation_config.json").write_text("{}", encoding="utf-8")
+    (artifacts_dir / "simulation_actions.json").write_text("[]", encoding="utf-8")
+    return run_dir, service
+
+
+class TestResolveAgentId:
+    def test_prefers_agent_id(self):
+        assert _resolve_agent_id({"agent_id": "x_1", "name": "Baidu"}, 0) == "x_1"
+
+    def test_falls_back_to_user_id(self):
+        assert _resolve_agent_id({"user_id": "u_42", "name": "Baidu"}, 0) == "u_42"
+
+    def test_generates_slug_from_name(self):
+        assert _resolve_agent_id({"name": "Google China"}, 0) == "google_china"
+        assert _resolve_agent_id({"name": "Baidu"}, 0) == "baidu"
+        assert _resolve_agent_id({"name": "  Spaced  Name  "}, 0) == "spaced_name"
+
+    def test_positional_fallback_when_no_name(self):
+        assert _resolve_agent_id({"type": "anon"}, 0) == "agent_1"
+        assert _resolve_agent_id({"type": "anon"}, 2) == "agent_3"
+
+    def test_empty_strings_treated_as_missing(self):
+        assert _resolve_agent_id({"agent_id": "", "user_id": "", "name": ""}, 0) == "agent_1"
+
+    def test_strips_whitespace(self):
+        assert _resolve_agent_id({"agent_id": "  x  "}, 0) == "x"
+
+
+class TestListAgentsFallbackId:
+    def test_list_agents_returns_stable_ids_without_agent_id(self, tmp_path):
+        run_dir, service = _init_run_no_agent_id(tmp_path)
+        result = service.list_agents(str(run_dir))
+        assert result["status"] == "ok"
+        assert result["count"] == 4
+        ids = [a["agent_id"] for a in result["agents"]]
+        assert ids[0] == "baidu"
+        assert ids[1] == "google_china"
+        # Third profile also named "Baidu" — gets same slug
+        assert ids[2] == "baidu"
+        # Fourth profile has no name — positional fallback
+        assert ids[3] == "agent_4"
+        # None should be empty or "unknown"
+        assert all(aid for aid in ids), "No agent_id should be empty"
+        assert "unknown" not in ids
+
+    def test_get_agent_works_with_fallback_id(self, tmp_path):
+        run_dir, service = _init_run_no_agent_id(tmp_path)
+        result = service.get_agent(str(run_dir), "google_china")
+        assert result["status"] == "ok"
+        assert result["agent"]["agent_id"] == "google_china"
+        assert result["agent"]["name"] == "Google China"
+
+
+class TestAskAgentFallbackId:
+    def test_ask_agent_with_fallback_id_creates_request(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MIROFISH_MODE", "agent")
+        monkeypatch.setenv("MIROFISH_LLM_PROVIDER", "agent_queue")
+        monkeypatch.setenv("MIROFISH_GRAPH_PROVIDER", "graphiti")
+        monkeypatch.setenv("MIROFISH_GRAPHITI_STORE", "file")
+        monkeypatch.setenv("MIROFISH_GRAPHITI_COMPAT_PATH", str(tmp_path / "graph_store.json"))
+
+        run_dir, service = _init_run_no_agent_id(tmp_path)
+        result = service.ask_agent(str(run_dir), "google_china", "What is your strategy?")
+        assert result["status"] == "need_agent_response"
+        assert result["agent_id"] == "google_china"
+
+
+class TestWebConsoleFallbackId:
+    def test_web_console_no_unknown_option(self, tmp_path):
+        """Web Console HTML must not contain 'unknown' as an agent option value."""
+        run_dir, service = _init_run_no_agent_id(tmp_path)
+        service.generate_web_console(str(run_dir))
+        html_path = run_dir / "artifacts" / "web" / "index.html"
+        html_content = html_path.read_text(encoding="utf-8")
+        # The dropdown options should use slug-based IDs, not "unknown"
+        assert 'value="unknown"' not in html_content
+        # Verify slug-based IDs are embedded
+        assert "baidu" in html_content
+        assert "google_china" in html_content
+
+    def test_web_console_profiles_have_agent_id_in_embedded_data(self, tmp_path):
+        """Embedded profiles JSON should contain agent_id after normalization."""
+        run_dir, service = _init_run_no_agent_id(tmp_path)
+        service.generate_web_console(str(run_dir))
+        html_path = run_dir / "artifacts" / "web" / "index.html"
+        html_content = html_path.read_text(encoding="utf-8")
+        # The embedded profiles JSON should contain the slug IDs
+        assert '"agent_id"' not in html_content or '"baidu"' in html_content or '"google_china"' in html_content

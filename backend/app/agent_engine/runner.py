@@ -6,6 +6,7 @@ import importlib.util
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -59,6 +60,27 @@ STAGED_DOWNSTREAM = {
     "report_generation": [],
     "followup_question": [],
 }
+
+_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _resolve_agent_id(profile: Dict[str, Any], index: int = 0) -> str:
+    """Derive a stable, non-empty agent_id from a profile dict.
+
+    Priority:
+    1. profile["agent_id"]  (if truthy)
+    2. profile["user_id"]   (if truthy)
+    3. slug of profile["name"]  (e.g. "Google China" -> "google_china")
+    4. positional fallback "agent_{index+1}"
+    """
+    raw = profile.get("agent_id") or profile.get("user_id")
+    if raw:
+        return str(raw).strip() or f"agent_{index + 1}"
+    name = profile.get("name")
+    if name and isinstance(name, str) and name.strip():
+        slug = _SLUG_RE.sub("_", name.strip().lower()).strip("_")
+        return slug or f"agent_{index + 1}"
+    return f"agent_{index + 1}"
 
 
 class PredictionRunService:
@@ -519,8 +541,8 @@ class PredictionRunService:
             return {"status": "ok", "agents": [], "count": 0}
         profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
         agents = []
-        for profile in profiles:
-            agent_id = str(profile.get("agent_id") or profile.get("user_id") or "")
+        for idx, profile in enumerate(profiles):
+            agent_id = _resolve_agent_id(profile, idx)
             agents.append({
                 "agent_id": agent_id,
                 "name": profile.get("name", ""),
@@ -535,8 +557,8 @@ class PredictionRunService:
         if not profiles_path.exists():
             return {"status": "error", "error": "profiles.json not found"}
         profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
-        for profile in profiles:
-            pid = str(profile.get("agent_id") or profile.get("user_id") or "")
+        for idx, profile in enumerate(profiles):
+            pid = _resolve_agent_id(profile, idx)
             if pid == agent_id:
                 return {"status": "ok", "agent": {
                     "agent_id": pid,
@@ -620,8 +642,8 @@ class PredictionRunService:
             return {"status": "error", "error": "profiles.json not found; cannot send questionnaire"}
         profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
         agents = [
-            {"agent_id": str(p.get("agent_id") or p.get("user_id") or ""), "profile": p}
-            for p in profiles
+            {"agent_id": _resolve_agent_id(p, i), "profile": p}
+            for i, p in enumerate(profiles)
         ]
         questionnaire_id = f"questionnaire_{uuid.uuid4().hex[:8]}"
         provider = create_graph_provider(self._graph_provider_name(state))
@@ -1460,7 +1482,7 @@ class PredictionRunService:
             "simulation_settings": settings,
             "actions": [
                 {
-                    "agent_id": str(profile.get("agent_id") or profile.get("user_id") or index + 1),
+                    "agent_id": _resolve_agent_id(profile, index),
                     "action_id": f"{round_id}_action_{index + 1}",
                     "round_id": round_id,
                 }
@@ -1582,7 +1604,7 @@ class PredictionRunService:
         profiles = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
         return {
             "profile_count": len(profiles),
-            "agent_ids": [str(profile.get("agent_id") or profile.get("user_id") or "") for profile in profiles],
+            "agent_ids": [_resolve_agent_id(profile, i) for i, profile in enumerate(profiles)],
         }
 
     def _config_summary(self, store: RunStore, state) -> Dict[str, Any]:
@@ -1849,6 +1871,11 @@ class PredictionRunService:
         timeline = artifacts.get("timeline.json", [])
         graph_snapshot = artifacts.get("graph_snapshot.json", {})
         profiles = artifacts.get("profiles.json", [])
+        # Normalize profile IDs before embedding (mirrors JS _resolveId logic)
+        if isinstance(profiles, list):
+            for _pi, _pp in enumerate(profiles):
+                if isinstance(_pp, dict) and not _pp.get("agent_id"):
+                    _pp["agent_id"] = _resolve_agent_id(_pp, _pi)
         sim_config = artifacts.get("simulation_config.json", {})
         sim_actions = artifacts.get("simulation_actions.json", [])
         agent_questions = interactions.get("agent_questions", [])
@@ -2172,6 +2199,22 @@ pre { background:var(--surface2); border:1px solid var(--border); border-radius:
     runDir: {{RUN_DIR_JSON}}
   };
 
+  // ── Agent ID resolver (mirrors Python _resolve_agent_id) ──────────────
+  function _resolveId(p, idx) {
+    if (p.agent_id) return String(p.agent_id).trim() || _posFallback(idx);
+    if (p.user_id) return String(p.user_id).trim() || _posFallback(idx);
+    if (p.name && typeof p.name === "string" && p.name.trim()) {
+      var slug = p.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+      return slug || _posFallback(idx);
+    }
+    return _posFallback(idx);
+  }
+  function _posFallback(idx) { return "agent_" + ((idx || 0) + 1); }
+
+  // Normalize embedded profiles so each has a guaranteed agent_id
+  var _profiles = Array.isArray(DATA.profiles) ? DATA.profiles : [];
+  _profiles.forEach(function(p, i) { if (!p.agent_id) p.agent_id = _resolveId(p, i); });
+
   // ── API Client ─────────────────────────────────────────────────────────
   let API_BASE = "http://localhost:5001";
   let API_ONLINE = false;
@@ -2212,6 +2255,8 @@ pre { background:var(--surface2); border:1px solid var(--border); border-radius:
         API_ONLINE = true;
         dot.className = "api-dot online";
         txt.textContent = "API Connected";
+        // Prefer API agent list (backend-normalized IDs) over embedded fallback
+        _refreshDropdownFromApi(resp);
       } else {
         API_ONLINE = false;
         dot.className = "api-dot offline";
@@ -2221,6 +2266,52 @@ pre { background:var(--surface2); border:1px solid var(--border); border-radius:
       API_ONLINE = false;
       dot.className = "api-dot offline";
       txt.textContent = "API Offline";
+    }
+  }
+
+  async function _refreshDropdownFromApi(initialResp) {
+    try {
+      var body = initialResp ? await initialResp.json() : null;
+      if (!body || !body.success) {
+        var r = await apiGet("/agents");
+        body = r;
+      }
+      if (!body || !body.success || !body.data) return;
+      var apiAgents = body.data.agents || [];
+      if (apiAgents.length === 0) return;
+      // Rebuild dropdown from API data (backend IDs are authoritative)
+      var sel = document.getElementById("ask-agent-select");
+      sel.innerHTML = '<option value="">-- Select an agent --</option>';
+      apiAgents.forEach(function(a) {
+        var opt = document.createElement("option");
+        opt.value = a.agent_id;
+        opt.textContent = (a.name || a.agent_id) + " (" + a.agent_id + ")";
+        sel.appendChild(opt);
+      });
+      // Also update the profiles array for agent cards display
+      _profiles.length = 0;
+      apiAgents.forEach(function(a, i) {
+        var p = a.profile || { agent_id: a.agent_id, name: a.name, persona: a.persona };
+        if (!p.agent_id) p.agent_id = a.agent_id;
+        _profiles.push(p);
+      });
+      // Re-render agent cards
+      _renderAgentCards();
+    } catch (e) { /* API dropdown refresh is best-effort */ }
+  }
+
+  function _renderAgentCards() {
+    var list = document.getElementById("agents-list");
+    if (_profiles.length === 0) {
+      list.innerHTML = '<div class="empty-state">No agent profiles generated yet.</div>';
+    } else {
+      list.innerHTML = _profiles.map(function(p, i) {
+        var aid = p.agent_id;
+        return '<div class="agent-card"><div class="agent-name">' + (p.name || aid) + '</div>' +
+          '<div class="agent-id">' + aid + '</div>' +
+          (p.persona ? '<div class="agent-persona">' + p.persona + '</div>' : '') +
+          '<pre style="margin-top:8px;">' + JSON.stringify(p, null, 2) + '</pre></div>';
+      }).join("");
     }
   }
 
@@ -2291,7 +2382,7 @@ pre { background:var(--surface2); border:1px solid var(--border); border-radius:
 
   // ── Overview ───────────────────────────────────────────────────────────
   document.getElementById("requirement-text").textContent = DATA.requirement || "No requirement specified";
-  var profiles = Array.isArray(DATA.profiles) ? DATA.profiles : [];
+  var profiles = _profiles;
   var timeline = Array.isArray(DATA.timeline) ? DATA.timeline : [];
   var simActions = Array.isArray(DATA.simActions) ? DATA.simActions : [];
   var triples = Array.isArray(DATA.graphSnapshot) ? DATA.graphSnapshot : (DATA.graphSnapshot && DATA.graphSnapshot.triples ? DATA.graphSnapshot.triples : []);
@@ -2330,8 +2421,8 @@ pre { background:var(--surface2); border:1px solid var(--border); border-radius:
   if (profiles.length === 0) {
     document.getElementById("agents-list").innerHTML = '<div class="empty-state">No agent profiles generated yet.</div>';
   } else {
-    document.getElementById("agents-list").innerHTML = profiles.map(function(p) {
-      var aid = p.agent_id || p.user_id || "unknown";
+    document.getElementById("agents-list").innerHTML = profiles.map(function(p, i) {
+      var aid = p.agent_id;
       return '<div class="agent-card"><div class="agent-name">' + (p.name || aid) + '</div>' +
         '<div class="agent-id">' + aid + '</div>' +
         (p.persona ? '<div class="agent-persona">' + p.persona + '</div>' : '') +
@@ -2394,8 +2485,8 @@ pre { background:var(--surface2); border:1px solid var(--border); border-radius:
   var askResultDiv = document.getElementById("ask-result");
   var askStatusSpan = document.getElementById("ask-status");
 
-  profiles.forEach(function(p) {
-    var aid = p.agent_id || p.user_id || "unknown";
+  profiles.forEach(function(p, i) {
+    var aid = p.agent_id;
     var opt = document.createElement("option");
     opt.value = aid;
     opt.textContent = (p.name || aid) + " (" + aid + ")";

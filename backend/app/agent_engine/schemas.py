@@ -19,6 +19,10 @@ AgentTaskType = Literal[
     "update_memory",
     "generate_report",
     "answer_followup_question",
+    "answer_agent_question",
+    "answer_agent_questionnaire",
+    "summarize_questionnaire",
+    "ask_report_question",
     "validate_json_output",
     "repair_invalid_json",
 ]
@@ -33,6 +37,10 @@ AGENT_TASK_TYPES = {
     "update_memory",
     "generate_report",
     "answer_followup_question",
+    "answer_agent_question",
+    "answer_agent_questionnaire",
+    "summarize_questionnaire",
+    "ask_report_question",
     "validate_json_output",
     "repair_invalid_json",
 }

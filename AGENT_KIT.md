@@ -59,8 +59,32 @@ summarize_round
 update_memory
 generate_report
 answer_followup_question
+answer_agent_question
+answer_agent_questionnaire
+summarize_questionnaire
+ask_report_question
 validate_json_output
 repair_invalid_json
+```
+
+Web Console and interaction commands:
+
+```bash
+# Generate the interactive Web Console
+uv run mirofish-agent web generate --run ../runs/chip-2036 --json
+
+# List agents and ask questions
+uv run mirofish-agent agents list --run ../runs/chip-2036 --json
+uv run mirofish-agent agents ask --run ../runs/chip-2036 --agent-id agent_1 --question "What is the biggest risk?" --json
+uv run mirofish-agent agents answer --run ../runs/chip-2036 --request-id req_XXXX --json
+
+# Send questionnaires
+uv run mirofish-agent questionnaire send --run ../runs/chip-2036 --questions questions.json --json
+uv run mirofish-agent questionnaire show --run ../runs/chip-2036 --questionnaire-id q_XXXX --json
+
+# Ask questions about the report
+uv run mirofish-agent report-question ask --run ../runs/chip-2036 --question "Summarize key risks" --json
+uv run mirofish-agent report-question answer --run ../runs/chip-2036 --request-id req_XXXX --json
 ```
 
 Full smoke:

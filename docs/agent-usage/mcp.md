@@ -36,6 +36,54 @@ Tools:
 - `mirofish_list_artifacts`
 - `mirofish_doctor`
 
+## Interaction Tools
+
+After a run completes, these tools let you interact with agents through the queue:
+
+- `mirofish_generate_web_console` — generates an interactive HTML console at `runs/<run_id>/artifacts/web/index.html`.
+- `mirofish_list_agents` — lists all agent profiles from a completed run.
+- `mirofish_get_agent` — returns a single agent's profile.
+- `mirofish_ask_agent` — sends a question to a specific agent via `agent_queue`. Returns `need_agent_response` with a `request_id`.
+- `mirofish_get_agent_answer` — after the desktop agent writes the response file, call this to validate, persist, and retrieve the answer.
+- `mirofish_send_questionnaire` — sends a batch questionnaire to all agents. `questions_json` is a JSON string: `'[{"question_id":"q1","question":"Biggest risk?"}, ...]'`.
+- `mirofish_get_questionnaire_result` — retrieves questionnaire answers and summary.
+- `mirofish_ask_report_question` — asks a question about the report via `agent_queue`.
+- `mirofish_get_report_question_answer` — retrieves and persists a report question answer.
+
+### Web Console
+
+The Web Console is a static HTML page with embedded run data plus live API interaction when the Flask backend is running.
+
+1. Generate the console:
+   ```bash
+   uv run mirofish-agent web generate --run ../runs/chip-2036 --json
+   ```
+   Or via MCP: call `mirofish_generate_web_console`.
+
+2. Open the generated file: `runs/<run_id>/artifacts/web/index.html`
+
+3. Start the Flask backend for interactive features:
+   ```bash
+   cd /Users/leaf/Documents/future/MiroFish/backend
+   uv run flask --app app run --port 5001
+   ```
+
+4. The console auto-detects the API at `http://localhost:5001`. You can change the base URL in the sidebar.
+
+When the API is offline, the console falls back to displaying embedded static data from the run artifacts.
+
+### Agent Q&A Flow
+
+1. Call `mirofish_ask_agent(run, agent_id, question)` — returns `request_id`.
+2. A desktop agent reads `runs/<run_id>/requests/<request_id>.json` and writes `runs/<run_id>/responses/<request_id>.json`.
+3. Call `mirofish_get_agent_answer(run, request_id)` to validate the response and persist it to `artifacts/interactions/agent_questions/`.
+
+### Questionnaire Flow
+
+1. Call `mirofish_send_questionnaire(run, questions_json)` with a JSON array of `{question_id, question}` objects.
+2. Each agent gets a separate `agent_queue` request per question.
+3. Call `mirofish_get_questionnaire_result(run, questionnaire_id)` to collect answers and summary.
+
 ## Staged Mode
 
 Use staged mode when a desktop agent should mirror the original MiroFish step-by-step UI flow. The simulation round count is a hard MCP field, not text hidden in the requirement.

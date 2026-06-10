@@ -57,6 +57,55 @@ FOLLOWUP_OUTPUT_SCHEMA = object_schema(
     ["answer_markdown", "used_graph_results", "confidence"],
 )
 
+AGENT_QUESTION_OUTPUT_SCHEMA = object_schema(
+    {
+        "agent_id": {"type": "string", "minLength": 1},
+        "answer_markdown": {"type": "string", "minLength": 1},
+        "used_memory": {"type": "array", "items": {"type": "object"}},
+        "used_graph_results": {"type": "array", "items": {"type": "object"}},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+    },
+    ["agent_id", "answer_markdown", "used_memory", "used_graph_results", "confidence"],
+)
+
+AGENT_QUESTIONNAIRE_OUTPUT_SCHEMA = object_schema(
+    {
+        "questionnaire_id": {"type": "string", "minLength": 1},
+        "answers": {
+            "type": "array",
+            "items": object_schema(
+                {
+                    "agent_id": {"type": "string", "minLength": 1},
+                    "question_id": {"type": "string", "minLength": 1},
+                    "answer_markdown": {"type": "string", "minLength": 1},
+                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                },
+                ["agent_id", "question_id", "answer_markdown", "confidence"],
+            ),
+        },
+        "summary_markdown": {"type": "string"},
+    },
+    ["questionnaire_id", "answers", "summary_markdown"],
+)
+
+QUESTIONNAIRE_SUMMARY_OUTPUT_SCHEMA = object_schema(
+    {
+        "questionnaire_id": {"type": "string", "minLength": 1},
+        "summary_markdown": {"type": "string", "minLength": 1},
+        "answer_count": {"type": "integer", "minimum": 0},
+    },
+    ["questionnaire_id", "summary_markdown", "answer_count"],
+)
+
+REPORT_QUESTION_OUTPUT_SCHEMA = object_schema(
+    {
+        "answer_markdown": {"type": "string", "minLength": 1},
+        "used_graph_results": {"type": "array", "items": {"type": "object"}},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+    },
+    ["answer_markdown", "used_graph_results", "confidence"],
+)
+
 ROUND_SUMMARY_OUTPUT_SCHEMA = object_schema(
     {
         "summary_markdown": {"type": "string", "minLength": 1},
@@ -99,6 +148,10 @@ TASK_OUTPUT_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "update_memory": MEMORY_UPDATE_OUTPUT_SCHEMA,
     "generate_report": REPORT_OUTPUT_SCHEMA,
     "answer_followup_question": FOLLOWUP_OUTPUT_SCHEMA,
+    "answer_agent_question": AGENT_QUESTION_OUTPUT_SCHEMA,
+    "answer_agent_questionnaire": AGENT_QUESTIONNAIRE_OUTPUT_SCHEMA,
+    "summarize_questionnaire": QUESTIONNAIRE_SUMMARY_OUTPUT_SCHEMA,
+    "ask_report_question": REPORT_QUESTION_OUTPUT_SCHEMA,
     "validate_json_output": VALIDATE_JSON_OUTPUT_SCHEMA,
     "repair_invalid_json": GENERIC_REPAIR_OUTPUT_SCHEMA,
 }

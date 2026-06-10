@@ -149,6 +149,65 @@ def create_server():
         return service.list_artifacts(run)
 
     @mcp.tool()
+    def mirofish_generate_web_console(run: str) -> Dict[str, Any]:
+        """Generate a static Web Console HTML for the given run."""
+        return service.generate_web_console(run)
+
+    @mcp.tool()
+    def mirofish_list_agents(run: str) -> Dict[str, Any]:
+        """List all agents from the run's profiles.json."""
+        return service.list_agents(run)
+
+    @mcp.tool()
+    def mirofish_get_agent(run: str, agent_id: str) -> Dict[str, Any]:
+        """Get a single agent's profile by agent_id."""
+        return service.get_agent(run, agent_id)
+
+    @mcp.tool()
+    def mirofish_ask_agent(run: str, agent_id: str, question: str, limit: int = 20) -> Dict[str, Any]:
+        """Ask a question to a specific agent. Creates an agent_queue request."""
+        return service.ask_agent(run, agent_id, question, limit)
+
+    @mcp.tool()
+    def mirofish_get_agent_answer(run: str, request_id: str) -> Dict[str, Any]:
+        """Retrieve and persist the answer for an agent question request."""
+        return service.get_agent_answer(run, request_id)
+
+    @mcp.tool()
+    def mirofish_send_questionnaire(run: str, questions_json: str) -> Dict[str, Any]:
+        """Send a questionnaire to all agents.
+
+        questions_json should be a JSON array of objects, each with "question_id" and "question" fields.
+        Example: '[{"question_id":"q1","question":"Biggest risk?"},{"question_id":"q2","question":"Opportunities?"}]'
+        """
+        import json as _json
+        try:
+            questions = _json.loads(questions_json)
+        except (ValueError, TypeError) as exc:
+            return {"status": "error", "error": f"questions_json must be valid JSON: {exc}"}
+        if not isinstance(questions, list) or len(questions) == 0:
+            return {"status": "error", "error": "questions_json must be a non-empty JSON array"}
+        for i, q in enumerate(questions):
+            if not isinstance(q, dict) or "question_id" not in q or "question" not in q:
+                return {"status": "error", "error": f"questions_json[{i}] must have 'question_id' and 'question' fields"}
+        return service.send_questionnaire(run, questions)
+
+    @mcp.tool()
+    def mirofish_get_questionnaire_result(run: str, questionnaire_id: str) -> Dict[str, Any]:
+        """Get the results of a questionnaire by its ID."""
+        return service.get_questionnaire_result(run, questionnaire_id)
+
+    @mcp.tool()
+    def mirofish_ask_report_question(run: str, question: str, limit: int = 20) -> Dict[str, Any]:
+        """Ask a question about the prediction report. Creates an agent_queue request."""
+        return service.ask_report_question(run, question, limit)
+
+    @mcp.tool()
+    def mirofish_get_report_question_answer(run: str, request_id: str) -> Dict[str, Any]:
+        """Retrieve and persist the answer for a report question request."""
+        return service.get_report_question_answer(run, request_id)
+
+    @mcp.tool()
     def mirofish_doctor(runs_dir: Optional[str] = None) -> Dict[str, Any]:
         return service.doctor(runs_dir)
 

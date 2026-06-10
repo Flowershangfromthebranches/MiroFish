@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any, Dict
 
 from .runner import PredictionRunService
@@ -182,6 +183,57 @@ def build_parser() -> argparse.ArgumentParser:
     add_json(artifacts_list)
     artifacts_list.add_argument("--run", required=True)
 
+    # ── Agent interaction commands ─────────────────────────────────────────
+
+    agents = sub.add_parser("agents")
+    agents_sub = agents.add_subparsers(dest="agents_command", required=True)
+    agents_list = agents_sub.add_parser("list")
+    add_json(agents_list)
+    agents_list.add_argument("--run", required=True)
+    agents_show = agents_sub.add_parser("show")
+    add_json(agents_show)
+    agents_show.add_argument("--run", required=True)
+    agents_show.add_argument("--agent-id", required=True)
+    agents_ask = agents_sub.add_parser("ask")
+    add_json(agents_ask)
+    agents_ask.add_argument("--run", required=True)
+    agents_ask.add_argument("--agent-id", required=True)
+    agents_ask.add_argument("--question", required=True)
+    agents_ask.add_argument("--limit", type=int, default=20)
+    agents_answer = agents_sub.add_parser("answer")
+    add_json(agents_answer)
+    agents_answer.add_argument("--run", required=True)
+    agents_answer.add_argument("--request-id", required=True)
+
+    report_question = sub.add_parser("report-question")
+    rq_sub = report_question.add_subparsers(dest="report_question_command", required=True)
+    rq_ask = rq_sub.add_parser("ask")
+    add_json(rq_ask)
+    rq_ask.add_argument("--run", required=True)
+    rq_ask.add_argument("--question", required=True)
+    rq_ask.add_argument("--limit", type=int, default=20)
+    rq_answer = rq_sub.add_parser("answer")
+    add_json(rq_answer)
+    rq_answer.add_argument("--run", required=True)
+    rq_answer.add_argument("--request-id", required=True)
+
+    questionnaire = sub.add_parser("questionnaire")
+    q_sub = questionnaire.add_subparsers(dest="questionnaire_command", required=True)
+    q_send = q_sub.add_parser("send")
+    add_json(q_send)
+    q_send.add_argument("--run", required=True)
+    q_send.add_argument("--questions", required=True)
+    q_show = q_sub.add_parser("show")
+    add_json(q_show)
+    q_show.add_argument("--run", required=True)
+    q_show.add_argument("--questionnaire-id", required=True)
+
+    web = sub.add_parser("web")
+    web_sub = web.add_subparsers(dest="web_command", required=True)
+    web_generate = web_sub.add_parser("generate")
+    add_json(web_generate)
+    web_generate.add_argument("--run", required=True)
+
     doctor = sub.add_parser("doctor")
     add_json(doctor)
     doctor.add_argument("--runs-dir", default=None)
@@ -260,6 +312,31 @@ def dispatch(args: argparse.Namespace) -> Dict[str, Any]:
         return service.get_followup_answer(args.run, args.request_id)
     if args.command == "artifacts":
         return service.list_artifacts(args.run)
+    if args.command == "agents":
+        if args.agents_command == "list":
+            return service.list_agents(args.run)
+        if args.agents_command == "show":
+            return service.get_agent(args.run, args.agent_id)
+        if args.agents_command == "ask":
+            return service.ask_agent(args.run, args.agent_id, args.question, args.limit)
+        if args.agents_command == "answer":
+            return service.get_agent_answer(args.run, args.request_id)
+    if args.command == "report-question":
+        if args.report_question_command == "ask":
+            return service.ask_report_question(args.run, args.question, args.limit)
+        if args.report_question_command == "answer":
+            return service.get_report_question_answer(args.run, args.request_id)
+    if args.command == "questionnaire":
+        if args.questionnaire_command == "send":
+            questions = json.loads(Path(args.questions).read_text(encoding="utf-8"))
+            if not isinstance(questions, list):
+                questions = [questions]
+            return service.send_questionnaire(args.run, questions)
+        if args.questionnaire_command == "show":
+            return service.get_questionnaire_result(args.run, args.questionnaire_id)
+    if args.command == "web":
+        if args.web_command == "generate":
+            return service.generate_web_console(args.run)
     if args.command == "doctor":
         return service.doctor(args.runs_dir)
     raise ValueError(f"unsupported command: {args.command}")

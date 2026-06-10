@@ -90,6 +90,45 @@ class MockLLMProvider(LLMProvider):
                 "used_graph_results": (task.structured_input or {}).get("graph_results", []),
                 "confidence": 0.5,
             }
+        if task.task_type == "answer_agent_question":
+            agent_id = (task.structured_input or {}).get("agent_id", "agent_1")
+            return {
+                "agent_id": agent_id,
+                "answer_markdown": f"Mock answer from {agent_id} generated without model APIs.",
+                "used_memory": [],
+                "used_graph_results": (task.structured_input or {}).get("graph_results", []),
+                "confidence": 0.5,
+            }
+        if task.task_type == "answer_agent_questionnaire":
+            questionnaire_id = (task.structured_input or {}).get("questionnaire_id", "q_mock")
+            questions = (task.structured_input or {}).get("questions", [])
+            agents = (task.structured_input or {}).get("agents", [])
+            answers = []
+            for question in questions:
+                for agent in agents:
+                    answers.append({
+                        "agent_id": agent.get("agent_id", "agent_1"),
+                        "question_id": question.get("question_id", "q1"),
+                        "answer_markdown": f"Mock answer from {agent.get('agent_id', 'agent_1')} to {question.get('question_id', 'q1')}.",
+                        "confidence": 0.5,
+                    })
+            return {
+                "questionnaire_id": questionnaire_id,
+                "answers": answers,
+                "summary_markdown": "Mock questionnaire summary generated without model APIs.",
+            }
+        if task.task_type == "summarize_questionnaire":
+            return {
+                "questionnaire_id": (task.structured_input or {}).get("questionnaire_id", "q_mock"),
+                "summary_markdown": "Mock questionnaire summary generated without model APIs.",
+                "answer_count": len((task.structured_input or {}).get("answers", [])),
+            }
+        if task.task_type == "ask_report_question":
+            return {
+                "answer_markdown": "Mock report question answer generated without model APIs.",
+                "used_graph_results": (task.structured_input or {}).get("graph_results", []),
+                "confidence": 0.5,
+            }
         if task.task_type == "validate_json_output":
             return {
                 "valid": True,

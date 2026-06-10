@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import html
 import json
 import os
 import shutil
@@ -16,7 +17,14 @@ from typing import Any, Dict, List, Optional
 from ..adapters.graph.factory import create_graph_provider
 from ..adapters.llm.agent_runtime import AgentRuntime
 from ..adapters.llm.factory import create_llm_provider
-from .contracts import FOLLOWUP_OUTPUT_SCHEMA, STAGE_CONTRACTS
+from .contracts import (
+    AGENT_QUESTION_OUTPUT_SCHEMA,
+    AGENT_QUESTIONNAIRE_OUTPUT_SCHEMA,
+    FOLLOWUP_OUTPUT_SCHEMA,
+    QUESTIONNAIRE_SUMMARY_OUTPUT_SCHEMA,
+    REPORT_QUESTION_OUTPUT_SCHEMA,
+    STAGE_CONTRACTS,
+)
 from .queue import AgentQueue
 from .schemas import AgentResponse, StageStatus
 from .state import RUN_STAGES, STAGED_RUN_STAGES, RunStore
@@ -501,6 +509,270 @@ class PredictionRunService:
                         }
                     )
         return {"status": "ok", "artifacts": artifacts}
+
+    # ── Agent interaction methods ──────────────────────────────────────────
+
+    def list_agents(self, run_dir: str) -> Dict[str, Any]:
+        store = RunStore(run_dir)
+        profiles_path = store.artifacts_dir / "profiles.json"
+        if not profiles_path.exists():
+            return {"status": "ok", "agents": [], "count": 0}
+        profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+        agents = []
+        for profile in profiles:
+            agent_id = str(profile.get("agent_id") or profile.get("user_id") or "")
+            agents.append({
+                "agent_id": agent_id,
+                "name": profile.get("name", ""),
+                "persona": profile.get("persona", ""),
+                "profile": profile,
+            })
+        return {"status": "ok", "agents": agents, "count": len(agents)}
+
+    def get_agent(self, run_dir: str, agent_id: str) -> Dict[str, Any]:
+        store = RunStore(run_dir)
+        profiles_path = store.artifacts_dir / "profiles.json"
+        if not profiles_path.exists():
+            return {"status": "error", "error": "profiles.json not found"}
+        profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+        for profile in profiles:
+            pid = str(profile.get("agent_id") or profile.get("user_id") or "")
+            if pid == agent_id:
+                return {"status": "ok", "agent": {
+                    "agent_id": pid,
+                    "name": profile.get("name", ""),
+                    "persona": profile.get("persona", ""),
+                    "profile": profile,
+                }}
+        return {"status": "error", "error": f"agent not found: {agent_id}"}
+
+    def ask_agent(self, run_dir: str, agent_id: str, question: str, limit: int = 20) -> Dict[str, Any]:
+        store = RunStore(run_dir)
+        state = store.load()
+        # Verify agent exists
+        agent_result = self.get_agent(run_dir, agent_id)
+        if agent_result["status"] == "error":
+            return agent_result
+        provider = create_graph_provider(self._graph_provider_name(state))
+        graph_results = provider.search(state.run_id, question, limit=limit)
+        runtime = AgentRuntime(
+            provider=create_llm_provider(self.llm_provider_name, run_dir=store.run_dir),
+            run_dir=str(store.run_dir),
+        )
+        result = runtime.run_task(
+            run_id=state.run_id,
+            task_type="answer_agent_question",
+            stage="interaction",
+            expected_schema=AGENT_QUESTION_OUTPUT_SCHEMA,
+            input_text=store.read_seed_text(),
+            input_files=state.seed_files,
+            structured_input={
+                "agent_id": agent_id,
+                "question": question,
+                "requirement": state.requirement,
+                "graph_results": graph_results,
+                "agent_profile": agent_result["agent"]["profile"],
+                "artifacts": self._artifact_context(store),
+            },
+            system_prompt=(
+                f"You are agent '{agent_id}'. Answer the question from your persona's perspective "
+                "using only run artifacts and GraphProvider retrieval context."
+            ),
+            user_prompt=question,
+            validation_rules={"strict": True},
+            retry_policy={"max_repair_attempts": 1},
+            context_refs=self._context_refs(store),
+            output_contract={"schema": AGENT_QUESTION_OUTPUT_SCHEMA},
+        )
+        if result.status == "need_agent_response":
+            return result.to_dict() | {"stage": "interaction", "type": "answer_agent_question", "agent_id": agent_id}
+        if result.status != "ok":
+            return {"status": "failed", "stage": "interaction", "error": result.error}
+        return self._persist_agent_question_answer(store, state.run_id, agent_id, f"mock_{uuid.uuid4().hex[:8]}", question, result.output or {})
+
+    def get_agent_answer(self, run_dir: str, request_id: str) -> Dict[str, Any]:
+        store = RunStore(run_dir)
+        state = store.load()
+        queue = AgentQueue(run_dir)
+        request = queue.load_request(request_id)
+        if request.type != "answer_agent_question" or request.stage != "interaction":
+            return {"status": "error", "error": f"request {request_id} is not an agent question request"}
+        response_path = store.responses_dir / f"{request_id}.json"
+        if not response_path.exists():
+            return {"status": "missing", "request_id": request_id, "expected_response_file": str(response_path)}
+        validation = queue.submit_response(response_path)
+        if not validation.ok:
+            if validation.repair_request:
+                return validation.repair_request.model_dump()
+            return {"status": "failed", "request_id": request_id, "errors": validation.errors}
+        response = queue.load_response(request_id)
+        if response.status == "error":
+            return {"status": "failed", "request_id": request_id, "error": response.error or "agent returned error"}
+        agent_id = str(request.structured_input.get("agent_id", ""))
+        question = str(request.structured_input.get("question", ""))
+        return self._persist_agent_question_answer(store, state.run_id, agent_id, request_id, question, response.output)
+
+    def send_questionnaire(self, run_dir: str, questions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        store = RunStore(run_dir)
+        state = store.load()
+        profiles_path = store.artifacts_dir / "profiles.json"
+        if not profiles_path.exists():
+            return {"status": "error", "error": "profiles.json not found; cannot send questionnaire"}
+        profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+        agents = [
+            {"agent_id": str(p.get("agent_id") or p.get("user_id") or ""), "profile": p}
+            for p in profiles
+        ]
+        questionnaire_id = f"questionnaire_{uuid.uuid4().hex[:8]}"
+        provider = create_graph_provider(self._graph_provider_name(state))
+        runtime = AgentRuntime(
+            provider=create_llm_provider(self.llm_provider_name, run_dir=store.run_dir),
+            run_dir=str(store.run_dir),
+        )
+        request_ids = []
+        for question_item in questions:
+            question_text = question_item.get("question", "")
+            question_id = question_item.get("question_id", f"q_{uuid.uuid4().hex[:6]}")
+            graph_results = provider.search(state.run_id, question_text, limit=10)
+            result = runtime.run_task(
+                run_id=state.run_id,
+                task_type="answer_agent_questionnaire",
+                stage="interaction",
+                expected_schema=AGENT_QUESTIONNAIRE_OUTPUT_SCHEMA,
+                input_text=store.read_seed_text(),
+                input_files=state.seed_files,
+                structured_input={
+                    "questionnaire_id": questionnaire_id,
+                    "question_id": question_id,
+                    "questions": [{"question_id": question_id, "question": question_text}],
+                    "agents": agents,
+                    "requirement": state.requirement,
+                    "graph_results": graph_results,
+                    "artifacts": self._artifact_context(store),
+                },
+                system_prompt=(
+                    "Answer the questionnaire on behalf of all agents. "
+                    "Each agent should answer from their own persona's perspective."
+                ),
+                user_prompt=question_text,
+                validation_rules={"strict": True},
+                retry_policy={"max_repair_attempts": 1},
+                context_refs=self._context_refs(store),
+                output_contract={"schema": AGENT_QUESTIONNAIRE_OUTPUT_SCHEMA},
+            )
+            if result.status == "need_agent_response":
+                request_ids.append(result.request_id)
+            elif result.status == "ok":
+                self._persist_questionnaire_answers(store, state.run_id, questionnaire_id, result.output or {})
+        # Save questionnaire metadata
+        self._persist_questionnaire_metadata(store, questionnaire_id, questions, request_ids)
+        return {
+            "status": "ok" if not request_ids else "need_agent_response",
+            "questionnaire_id": questionnaire_id,
+            "request_ids": request_ids,
+            "question_count": len(questions),
+            "agent_count": len(agents),
+        }
+
+    def get_questionnaire_result(self, run_dir: str, questionnaire_id: str) -> Dict[str, Any]:
+        store = RunStore(run_dir)
+        questionnaires_dir = store.artifacts_dir / "interactions" / "questionnaires"
+        meta_path = questionnaires_dir / f"{questionnaire_id}_meta.json"
+        if not meta_path.exists():
+            return {"status": "error", "error": f"questionnaire not found: {questionnaire_id}"}
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        # Collect all answers
+        answers = []
+        answers_path = questionnaires_dir / f"{questionnaire_id}_answers.json"
+        if answers_path.exists():
+            answers = json.loads(answers_path.read_text(encoding="utf-8"))
+        # Check pending requests
+        pending_request_ids = meta.get("request_ids", [])
+        queue = AgentQueue(run_dir)
+        for req_id in list(pending_request_ids):
+            response_path = store.responses_dir / f"{req_id}.json"
+            if response_path.exists():
+                try:
+                    validation = queue.submit_response(response_path)
+                    if validation.ok:
+                        response = queue.load_response(req_id)
+                        if response.status == "ok":
+                            new_answers = self._extract_questionnaire_answers(response.output)
+                            answers.extend(new_answers)
+                            # Persist summary_markdown from response if present
+                            resp_summary = response.output.get("summary_markdown", "")
+                            if resp_summary:
+                                meta["summary_markdown"] = resp_summary
+                            pending_request_ids.remove(req_id)
+                except Exception:
+                    pass
+        # Re-save answers if we collected new ones
+        if answers:
+            self._write_json(answers_path, answers)
+        # Update metadata
+        meta["request_ids"] = pending_request_ids
+        meta["answer_count"] = len(answers)
+        self._write_json(meta_path, meta)
+        summary = meta.get("summary_markdown", "")
+        return {
+            "status": "ok" if not pending_request_ids else "partial",
+            "questionnaire_id": questionnaire_id,
+            "answers": answers,
+            "answer_count": len(answers),
+            "pending_request_ids": pending_request_ids,
+            "summary_markdown": summary,
+        }
+
+    def ask_report_question(self, run_dir: str, question: str, limit: int = 20) -> Dict[str, Any]:
+        store = RunStore(run_dir)
+        state = store.load()
+        provider = create_graph_provider(self._graph_provider_name(state))
+        graph_results = provider.search(state.run_id, question, limit=limit)
+        runtime = AgentRuntime(
+            provider=create_llm_provider(self.llm_provider_name, run_dir=store.run_dir),
+            run_dir=str(store.run_dir),
+        )
+        result = runtime.run_task(
+            run_id=state.run_id,
+            task_type="ask_report_question",
+            stage="interaction",
+            expected_schema=REPORT_QUESTION_OUTPUT_SCHEMA,
+            input_text=store.read_seed_text(),
+            input_files=state.seed_files,
+            structured_input={
+                "question": question,
+                "requirement": state.requirement,
+                "graph_results": graph_results,
+                "artifacts": self._artifact_context(store),
+            },
+            system_prompt="Answer a question about the prediction report using only run artifacts and GraphProvider retrieval context.",
+            user_prompt=question,
+            validation_rules={"strict": True},
+            retry_policy={"max_repair_attempts": 1},
+            context_refs=self._context_refs(store),
+            output_contract={"schema": REPORT_QUESTION_OUTPUT_SCHEMA},
+        )
+        if result.status == "need_agent_response":
+            return result.to_dict() | {"stage": "interaction", "type": "ask_report_question"}
+        if result.status != "ok":
+            return {"status": "failed", "stage": "interaction", "error": result.error}
+        return self._persist_report_question_answer(store, state.run_id, f"mock_{uuid.uuid4().hex[:8]}", question, result.output or {})
+
+    def generate_web_console(self, run_dir: str) -> Dict[str, Any]:
+        store = RunStore(run_dir)
+        web_dir = store.artifacts_dir / "web"
+        web_dir.mkdir(parents=True, exist_ok=True)
+        html_path = web_dir / "index.html"
+        # Read all relevant artifacts for embedding
+        artifact_data = self._collect_web_console_data(store)
+        artifact_data["run_dir"] = str(store.run_dir)
+        html_content = self._render_web_console_html(artifact_data)
+        html_path.write_text(html_content, encoding="utf-8")
+        return {
+            "status": "ok",
+            "path": str(html_path),
+            "artifact_count": len(artifact_data),
+        }
 
     def doctor(self, runs_dir: Optional[str] = None) -> Dict[str, Any]:
         checks = []
@@ -1379,3 +1651,1057 @@ class PredictionRunService:
 
     def _write_json(self, path: Path, data: Any) -> None:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # ── Interaction helper methods ─────────────────────────────────────────
+
+    def _persist_agent_question_answer(
+        self,
+        store: RunStore,
+        run_id: str,
+        agent_id: str,
+        request_id: str,
+        question: str,
+        output: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        questions_dir = store.artifacts_dir / "interactions" / "agent_questions"
+        questions_dir.mkdir(parents=True, exist_ok=True)
+        markdown_path = questions_dir / f"{request_id}.md"
+        json_path = questions_dir / f"{request_id}.json"
+        answer_md = output.get("answer_markdown", "")
+        markdown_path.write_text(answer_md, encoding="utf-8")
+        payload = {
+            "run_id": run_id,
+            "request_id": request_id,
+            "agent_id": agent_id,
+            "question": question,
+            "answer": output,
+        }
+        self._write_json(json_path, payload)
+        return {
+            "status": "ok",
+            "request_id": request_id,
+            "agent_id": agent_id,
+            "question": question,
+            "answer": output,
+            "artifacts": {
+                "markdown": str(markdown_path),
+                "json": str(json_path),
+            },
+        }
+
+    def _persist_questionnaire_answers(
+        self,
+        store: RunStore,
+        run_id: str,
+        questionnaire_id: str,
+        output: Dict[str, Any],
+    ) -> None:
+        questionnaires_dir = store.artifacts_dir / "interactions" / "questionnaires"
+        questionnaires_dir.mkdir(parents=True, exist_ok=True)
+        answers_path = questionnaires_dir / f"{questionnaire_id}_answers.json"
+        existing = []
+        if answers_path.exists():
+            existing = json.loads(answers_path.read_text(encoding="utf-8"))
+        new_answers = self._extract_questionnaire_answers(output)
+        existing.extend(new_answers)
+        self._write_json(answers_path, existing)
+
+    def _extract_questionnaire_answers(self, output: Dict[str, Any]) -> List[Dict[str, Any]]:
+        answers = output.get("answers", [])
+        if isinstance(answers, list):
+            return answers
+        return []
+
+    def _persist_questionnaire_metadata(
+        self,
+        store: RunStore,
+        questionnaire_id: str,
+        questions: List[Dict[str, Any]],
+        request_ids: List[str],
+    ) -> None:
+        questionnaires_dir = store.artifacts_dir / "interactions" / "questionnaires"
+        questionnaires_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = questionnaires_dir / f"{questionnaire_id}_meta.json"
+        meta = {
+            "questionnaire_id": questionnaire_id,
+            "questions": questions,
+            "request_ids": request_ids,
+            "answer_count": 0,
+            "summary_markdown": "",
+        }
+        self._write_json(meta_path, meta)
+
+    def _persist_report_question_answer(
+        self,
+        store: RunStore,
+        run_id: str,
+        request_id: str,
+        question: str,
+        output: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        rq_dir = store.artifacts_dir / "interactions" / "report_questions"
+        rq_dir.mkdir(parents=True, exist_ok=True)
+        markdown_path = rq_dir / f"{request_id}.md"
+        json_path = rq_dir / f"{request_id}.json"
+        answer_md = output.get("answer_markdown", "")
+        markdown_path.write_text(answer_md, encoding="utf-8")
+        payload = {
+            "run_id": run_id,
+            "request_id": request_id,
+            "question": question,
+            "answer": output,
+        }
+        self._write_json(json_path, payload)
+        return {
+            "status": "ok",
+            "request_id": request_id,
+            "question": question,
+            "answer": output,
+            "artifacts": {
+                "markdown": str(markdown_path),
+                "json": str(json_path),
+            },
+        }
+
+    def get_report_question_answer(self, run_dir: str, request_id: str) -> Dict[str, Any]:
+        store = RunStore(run_dir)
+        state = store.load()
+        queue = AgentQueue(run_dir)
+        request = queue.load_request(request_id)
+        if request.type != "ask_report_question" or request.stage != "interaction":
+            return {"status": "error", "error": f"request {request_id} is not a report question request"}
+        response_path = store.responses_dir / f"{request_id}.json"
+        if not response_path.exists():
+            return {"status": "missing", "request_id": request_id, "expected_response_file": str(response_path)}
+        validation = queue.submit_response(response_path)
+        if not validation.ok:
+            if validation.repair_request:
+                return validation.repair_request.model_dump()
+            return {"status": "failed", "request_id": request_id, "errors": validation.errors}
+        response = queue.load_response(request_id)
+        if response.status == "error":
+            return {"status": "failed", "request_id": request_id, "error": response.error or "agent returned error"}
+        question = str(request.structured_input.get("question", ""))
+        return self._persist_report_question_answer(store, state.run_id, request_id, question, response.output)
+
+    def _collect_web_console_data(self, store: RunStore) -> Dict[str, Any]:
+        artifacts = store.artifacts_dir
+        data: Dict[str, Any] = {"run_id": "", "artifacts": {}}
+        # Try to load state for run_id
+        state_path = store.run_dir / "state.json"
+        if state_path.exists():
+            state_data = json.loads(state_path.read_text(encoding="utf-8"))
+            data["run_id"] = state_data.get("run_id", "")
+            data["requirement"] = state_data.get("requirement", "")
+            data["simulation_settings"] = state_data.get("simulation_settings", {})
+        # Read artifact files
+        artifact_names = [
+            "report.md",
+            "verdict.json",
+            "timeline.json",
+            "graph_snapshot.json",
+            "profiles.json",
+            "simulation_config.json",
+            "simulation_actions.json",
+        ]
+        for name in artifact_names:
+            path = artifacts / name
+            if path.exists():
+                if name.endswith(".json"):
+                    try:
+                        data["artifacts"][name] = json.loads(path.read_text(encoding="utf-8"))
+                    except json.JSONDecodeError:
+                        data["artifacts"][name] = None
+                else:
+                    data["artifacts"][name] = path.read_text(encoding="utf-8")
+        # Read interaction data
+        interactions: Dict[str, Any] = {"agent_questions": [], "questionnaires": []}
+        aq_dir = artifacts / "interactions" / "agent_questions"
+        if aq_dir.exists():
+            for p in sorted(aq_dir.glob("*.json")):
+                try:
+                    interactions["agent_questions"].append(json.loads(p.read_text(encoding="utf-8")))
+                except json.JSONDecodeError:
+                    pass
+        q_dir = artifacts / "interactions" / "questionnaires"
+        if q_dir.exists():
+            for p in sorted(q_dir.glob("*_meta.json")):
+                try:
+                    meta = json.loads(p.read_text(encoding="utf-8"))
+                    answers_path = p.parent / f"{meta['questionnaire_id']}_answers.json"
+                    answers = []
+                    if answers_path.exists():
+                        answers = json.loads(answers_path.read_text(encoding="utf-8"))
+                    meta["answers"] = answers
+                    interactions["questionnaires"].append(meta)
+                except json.JSONDecodeError:
+                    pass
+        data["interactions"] = interactions
+        return data
+
+    def _render_web_console_html(self, data: Dict[str, Any]) -> str:
+        run_id = data.get("run_id", "unknown")
+        requirement = data.get("requirement", "")
+        artifacts = data.get("artifacts", {})
+        interactions = data.get("interactions", {})
+        report_md = artifacts.get("report.md", "# Report not yet generated")
+        verdict = artifacts.get("verdict.json", {})
+        timeline = artifacts.get("timeline.json", [])
+        graph_snapshot = artifacts.get("graph_snapshot.json", {})
+        profiles = artifacts.get("profiles.json", [])
+        sim_config = artifacts.get("simulation_config.json", {})
+        sim_actions = artifacts.get("simulation_actions.json", [])
+        agent_questions = interactions.get("agent_questions", [])
+        questionnaires = interactions.get("questionnaires", [])
+        # JSON-escape for embedding
+        def json_embed(obj):
+            return json.dumps(obj, ensure_ascii=False)
+        return _WEB_CONSOLE_TEMPLATE.replace(
+            "{{RUN_ID}}", html.escape(str(run_id), quote=True)
+        ).replace(
+            "{{RUN_ID_JSON}}", json_embed(run_id)
+        ).replace(
+            "{{REQUIREMENT_JSON}}", json_embed(requirement)
+        ).replace(
+            "{{REPORT_MD_JSON}}", json_embed(report_md)
+        ).replace(
+            "{{RUN_DIR_JSON}}", json_embed(data.get("run_dir", ""))
+        ).replace(
+            "{{VERDICT_JSON}}", json_embed(verdict)
+        ).replace(
+            "{{TIMELINE_JSON}}", json_embed(timeline)
+        ).replace(
+            "{{GRAPH_SNAPSHOT_JSON}}", json_embed(graph_snapshot)
+        ).replace(
+            "{{PROFILES_JSON}}", json_embed(profiles)
+        ).replace(
+            "{{SIM_CONFIG_JSON}}", json_embed(sim_config)
+        ).replace(
+            "{{SIM_ACTIONS_JSON}}", json_embed(sim_actions)
+        ).replace(
+            "{{AGENT_QUESTIONS_JSON}}", json_embed(agent_questions)
+        ).replace(
+            "{{QUESTIONNAIRES_JSON}}", json_embed(questionnaires)
+        )
+
+
+# ── Web Console HTML template ────────────────────────────────────────────
+
+_WEB_CONSOLE_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiroFish Web Console — {{RUN_ID}}</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #232733;
+  --border: #2d3140;
+  --text: #e2e4e9;
+  --text2: #9ca0ad;
+  --accent: #6c8cff;
+  --accent2: #4a6adf;
+  --success: #4caf50;
+  --warn: #ff9800;
+  --error: #f44336;
+  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:var(--bg); color:var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height:1.6; }
+.app { display:flex; height:100vh; }
+.sidebar { width:240px; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; flex-shrink:0; }
+.sidebar-header { padding:16px 20px; border-bottom:1px solid var(--border); }
+.sidebar-header h1 { font-size:16px; font-weight:600; color:var(--accent); }
+.sidebar-header .run-id { font-size:11px; color:var(--text2); font-family:var(--mono); margin-top:4px; }
+.nav { flex:1; padding:8px 0; overflow-y:auto; }
+.nav-item { padding:10px 20px; cursor:pointer; color:var(--text2); font-size:13px; transition:all .15s; display:flex; align-items:center; gap:8px; }
+.nav-item:hover { background:var(--surface2); color:var(--text); }
+.nav-item.active { background:var(--surface2); color:var(--accent); border-right:2px solid var(--accent); }
+.nav-icon { width:16px; text-align:center; font-size:14px; }
+.api-status { padding:12px 20px; border-top:1px solid var(--border); font-size:11px; display:flex; align-items:center; gap:6px; }
+.api-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+.api-dot.online { background:var(--success); }
+.api-dot.offline { background:var(--error); }
+.api-dot.checking { background:var(--warn); animation: pulse 1s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+.main { flex:1; overflow-y:auto; }
+.panel { display:none; padding:24px 32px; max-width:1000px; }
+.panel.active { display:block; }
+.panel h2 { font-size:20px; font-weight:600; margin-bottom:16px; color:var(--text); }
+.panel h3 { font-size:15px; font-weight:600; margin:20px 0 8px; color:var(--text); }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px 20px; margin-bottom:16px; }
+.card-header { font-size:13px; font-weight:600; color:var(--text2); text-transform:uppercase; letter-spacing:.5px; margin-bottom:8px; }
+.stat-row { display:flex; gap:16px; margin-bottom:16px; }
+.stat { flex:1; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:14px 16px; }
+.stat-value { font-size:24px; font-weight:700; color:var(--accent); }
+.stat-label { font-size:11px; color:var(--text2); text-transform:uppercase; letter-spacing:.5px; margin-top:2px; }
+.badge { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
+.badge-ok { background:rgba(76,175,80,.15); color:var(--success); }
+.badge-warn { background:rgba(255,152,0,.15); color:var(--warn); }
+.badge-error { background:rgba(244,67,54,.15); color:var(--error); }
+.badge-pending { background:rgba(108,140,255,.15); color:var(--accent); }
+pre, code { font-family:var(--mono); font-size:12px; }
+pre { background:var(--surface2); border:1px solid var(--border); border-radius:6px; padding:12px 16px; overflow-x:auto; white-space:pre-wrap; word-break:break-word; color:var(--text2); max-height:400px; overflow-y:auto; }
+.report-content { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:24px; }
+.report-content h1,.report-content h2,.report-content h3 { color:var(--accent); margin:16px 0 8px; }
+.report-content p { margin-bottom:8px; color:var(--text); }
+.agent-card { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:12px; }
+.agent-card .agent-name { font-weight:600; font-size:15px; color:var(--accent); }
+.agent-card .agent-id { font-size:11px; color:var(--text2); font-family:var(--mono); }
+.agent-card .agent-persona { font-size:13px; color:var(--text2); margin-top:4px; }
+.timeline-item { display:flex; gap:12px; padding:8px 0; border-bottom:1px solid var(--border); }
+.timeline-item:last-child { border-bottom:none; }
+.timeline-round { font-weight:700; color:var(--accent); min-width:60px; font-size:13px; }
+.timeline-detail { flex:1; font-size:13px; color:var(--text2); }
+.graph-entity { display:inline-block; background:var(--surface2); border:1px solid var(--border); border-radius:4px; padding:4px 10px; margin:3px; font-size:12px; color:var(--text); font-family:var(--mono); }
+.qa-item { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:12px; }
+.qa-question { font-weight:600; color:var(--text); margin-bottom:8px; font-size:14px; }
+.qa-answer { color:var(--text2); font-size:13px; white-space:pre-wrap; }
+.qa-meta { font-size:11px; color:var(--text2); margin-top:8px; font-family:var(--mono); }
+.empty-state { text-align:center; padding:48px; color:var(--text2); font-size:14px; }
+.requirement-box { background:var(--surface2); border-left:3px solid var(--accent); padding:12px 16px; border-radius:0 6px 6px 0; margin-bottom:16px; font-size:14px; color:var(--text); }
+.tab-bar { display:flex; gap:4px; margin-bottom:16px; }
+.tab-btn { padding:6px 14px; border-radius:6px; border:1px solid var(--border); background:transparent; color:var(--text2); cursor:pointer; font-size:12px; }
+.tab-btn.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+.action-item { background:var(--surface2); border-radius:6px; padding:10px 14px; margin-bottom:8px; font-size:13px; }
+.action-item .action-agent { color:var(--accent); font-weight:600; }
+.action-item .action-type { color:var(--text2); font-size:11px; font-family:var(--mono); }
+/* Interactive form styles */
+.form-group { margin-bottom:14px; }
+.form-group label { display:block; font-size:12px; font-weight:600; color:var(--text2); text-transform:uppercase; letter-spacing:.5px; margin-bottom:6px; }
+.form-input, .form-select, .form-textarea { width:100%; background:var(--surface2); border:1px solid var(--border); border-radius:6px; padding:10px 14px; color:var(--text); font-size:13px; font-family:inherit; outline:none; transition:border-color .15s; }
+.form-input:focus, .form-select:focus, .form-textarea:focus { border-color:var(--accent); }
+.form-textarea { min-height:80px; resize:vertical; }
+.form-select { appearance:none; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%239ca0ad' d='M6 8L1 3h10z'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 12px center; padding-right:32px; }
+.form-select option { background:var(--surface); color:var(--text); }
+.btn { display:inline-flex; align-items:center; gap:6px; padding:8px 18px; border-radius:6px; border:none; font-size:13px; font-weight:600; cursor:pointer; transition:all .15s; }
+.btn-primary { background:var(--accent); color:#fff; }
+.btn-primary:hover { background:var(--accent2); }
+.btn-primary:disabled { opacity:.5; cursor:not-allowed; }
+.btn-secondary { background:var(--surface2); color:var(--text); border:1px solid var(--border); }
+.btn-secondary:hover { background:var(--border); }
+.btn-sm { padding:5px 12px; font-size:12px; }
+.btn-row { display:flex; gap:8px; align-items:center; margin-top:12px; }
+.interaction-result { margin-top:16px; }
+.spinner { display:inline-block; width:14px; height:14px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .6s linear infinite; }
+@keyframes spin { to{transform:rotate(360deg)} }
+.toast { position:fixed; bottom:24px; right:24px; padding:12px 20px; border-radius:8px; font-size:13px; font-weight:500; z-index:9999; animation:slideUp .3s ease; }
+.toast-success { background:rgba(76,175,80,.9); color:#fff; }
+.toast-error { background:rgba(244,67,54,.9); color:#fff; }
+@keyframes slideUp { from{transform:translateY(20px);opacity:0} to{transform:translateY(0);opacity:1} }
+.question-row { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+.question-row .form-input { flex:1; }
+.api-base-row { display:flex; gap:8px; align-items:center; margin-top:8px; }
+.api-base-row .form-input { flex:1; font-size:11px; padding:6px 10px; }
+.section-divider { border:none; border-top:1px solid var(--border); margin:20px 0; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <h1>MiroFish Console</h1>
+      <div class="run-id">{{RUN_ID}}</div>
+    </div>
+    <div class="nav" id="nav">
+      <div class="nav-item active" data-panel="overview"><span class="nav-icon">&#9672;</span> Overview</div>
+      <div class="nav-item" data-panel="report"><span class="nav-icon">&#9673;</span> Report</div>
+      <div class="nav-item" data-panel="agents"><span class="nav-icon">&#9679;</span> Agents</div>
+      <div class="nav-item" data-panel="timeline"><span class="nav-icon">&#9656;</span> Timeline</div>
+      <div class="nav-item" data-panel="graph"><span class="nav-icon">&#9674;</span> Graph</div>
+      <div class="nav-item" data-panel="simulation"><span class="nav-icon">&#9655;</span> Simulation</div>
+      <div class="nav-item" data-panel="ask"><span class="nav-icon">&#9681;</span> Ask Agent</div>
+      <div class="nav-item" data-panel="questionnaires"><span class="nav-icon">&#9683;</span> Questionnaires</div>
+      <div class="nav-item" data-panel="report-q"><span class="nav-icon">?</span> Report Q&amp;A</div>
+      <div class="nav-item" data-panel="history"><span class="nav-icon">&#9776;</span> History</div>
+      <div class="nav-item" data-panel="raw"><span class="nav-icon">&lt;/&gt;</span> Raw Artifacts</div>
+    </div>
+    <div class="api-status" id="api-status">
+      <span class="api-dot checking" id="api-dot"></span>
+      <span id="api-status-text">Checking API...</span>
+    </div>
+    <div style="padding:0 20px 12px;">
+      <div class="api-base-row">
+        <input class="form-input" id="api-base-input" value="http://localhost:5001" placeholder="API Base URL" style="font-size:11px;">
+        <button class="btn btn-sm btn-secondary" id="api-reconnect-btn">Connect</button>
+      </div>
+    </div>
+  </div>
+  <div class="main">
+    <!-- Overview Panel -->
+    <div class="panel active" id="panel-overview">
+      <h2>Overview</h2>
+      <div class="requirement-box" id="requirement-text"></div>
+      <div class="stat-row" id="overview-stats"></div>
+      <div class="card">
+        <div class="card-header">Verdict</div>
+        <div id="verdict-display"></div>
+      </div>
+    </div>
+    <!-- Report Panel -->
+    <div class="panel" id="panel-report">
+      <h2>Report</h2>
+      <div class="report-content" id="report-content"></div>
+    </div>
+    <!-- Agents Panel -->
+    <div class="panel" id="panel-agents">
+      <h2>Agents</h2>
+      <div id="agents-list"></div>
+    </div>
+    <!-- Timeline Panel -->
+    <div class="panel" id="panel-timeline">
+      <h2>Timeline</h2>
+      <div class="card" id="timeline-list"></div>
+    </div>
+    <!-- Graph Panel -->
+    <div class="panel" id="panel-graph">
+      <h2>Knowledge Graph</h2>
+      <div class="stat-row" id="graph-stats"></div>
+      <div class="card">
+        <div class="card-header">Entities</div>
+        <div id="graph-entities"></div>
+      </div>
+      <div class="card">
+        <div class="card-header">Triples</div>
+        <div id="graph-triples" style="max-height:400px;overflow-y:auto;"></div>
+      </div>
+    </div>
+    <!-- Simulation Panel -->
+    <div class="panel" id="panel-simulation">
+      <h2>Simulation</h2>
+      <div class="stat-row" id="sim-stats"></div>
+      <div id="sim-actions"></div>
+    </div>
+    <!-- Ask Agent Panel (Interactive) -->
+    <div class="panel" id="panel-ask">
+      <h2>Ask an Agent</h2>
+      <div class="card">
+        <div class="card-header">New Question</div>
+        <div class="form-group">
+          <label>Select Agent</label>
+          <select class="form-select" id="ask-agent-select">
+            <option value="">-- Select an agent --</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Question</label>
+          <textarea class="form-textarea" id="ask-question-input" placeholder="Type your question for this agent..."></textarea>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="ask-submit-btn" disabled>Submit Question</button>
+          <span id="ask-status" style="font-size:12px;color:var(--text2);"></span>
+        </div>
+      </div>
+      <div class="interaction-result" id="ask-result"></div>
+      <hr class="section-divider">
+      <h3>Previous Questions</h3>
+      <div id="ask-history"></div>
+    </div>
+    <!-- Questionnaires Panel (Interactive) -->
+    <div class="panel" id="panel-questionnaires">
+      <h2>Questionnaires</h2>
+      <div class="card">
+        <div class="card-header">New Questionnaire</div>
+        <div id="questionnaire-questions">
+          <div class="question-row" data-qidx="0">
+            <input class="form-input" placeholder="Question ID (e.g. q1)" style="max-width:140px;" value="q1">
+            <input class="form-input" placeholder="Question text..." style="flex:1;">
+            <button class="btn btn-sm btn-secondary" onclick="removeQuestionRow(this)">Remove</button>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-secondary btn-sm" id="add-question-btn">+ Add Question</button>
+          <button class="btn btn-primary" id="questionnaire-submit-btn">Send Questionnaire</button>
+          <span id="questionnaire-status" style="font-size:12px;color:var(--text2);"></span>
+        </div>
+      </div>
+      <div class="interaction-result" id="questionnaire-result"></div>
+      <hr class="section-divider">
+      <h3>Previous Questionnaires</h3>
+      <div id="questionnaire-history"></div>
+    </div>
+    <!-- Report Q&A Panel (Interactive) -->
+    <div class="panel" id="panel-report-q">
+      <h2>Report Q&amp;A</h2>
+      <div class="card">
+        <div class="card-header">Ask a question about the report</div>
+        <div class="form-group">
+          <label>Question</label>
+          <textarea class="form-textarea" id="report-q-input" placeholder="Ask a follow-up question about the report findings..."></textarea>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" id="report-q-submit-btn">Submit Question</button>
+          <span id="report-q-status" style="font-size:12px;color:var(--text2);"></span>
+        </div>
+      </div>
+      <div class="interaction-result" id="report-q-result"></div>
+      <hr class="section-divider">
+      <h3>Previous Report Questions</h3>
+      <div id="report-q-history"></div>
+    </div>
+    <!-- History Panel -->
+    <div class="panel" id="panel-history">
+      <h2>Interaction History</h2>
+      <div id="all-interactions-list"></div>
+    </div>
+    <!-- Raw Artifacts Panel -->
+    <div class="panel" id="panel-raw">
+      <h2>Raw Artifacts</h2>
+      <div class="tab-bar" id="raw-tabs"></div>
+      <div id="raw-content"></div>
+    </div>
+  </div>
+</div>
+<script>
+(function() {
+  // ── Embedded data ──────────────────────────────────────────────────────
+  const DATA = {
+    runId: {{RUN_ID_JSON}},
+    requirement: {{REQUIREMENT_JSON}},
+    reportMd: {{REPORT_MD_JSON}},
+    verdict: {{VERDICT_JSON}},
+    timeline: {{TIMELINE_JSON}},
+    graphSnapshot: {{GRAPH_SNAPSHOT_JSON}},
+    profiles: {{PROFILES_JSON}},
+    simConfig: {{SIM_CONFIG_JSON}},
+    simActions: {{SIM_ACTIONS_JSON}},
+    agentQuestions: {{AGENT_QUESTIONS_JSON}},
+    questionnaires: {{QUESTIONNAIRES_JSON}},
+    runDir: {{RUN_DIR_JSON}}
+  };
+
+  // ── API Client ─────────────────────────────────────────────────────────
+  let API_BASE = "http://localhost:5001";
+  let API_ONLINE = false;
+  let pollTimers = {};
+  const POLL_INTERVAL = 3000;
+  const POLL_MAX = 120000;
+
+  function apiUrl(path) {
+    const base = API_BASE.replace(/\/+$/, "");
+    const sep = path.indexOf("?") >= 0 ? "&" : "?";
+    return base + "/api/interaction" + path + sep + "run=" + encodeURIComponent(DATA.runDir);
+  }
+
+  async function apiGet(path) {
+    const resp = await fetch(apiUrl(path), { method: "GET" });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    return resp.json();
+  }
+
+  async function apiPost(path, body) {
+    const resp = await fetch(apiUrl(path), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    return resp.json();
+  }
+
+  async function checkApiStatus() {
+    const dot = document.getElementById("api-dot");
+    const txt = document.getElementById("api-status-text");
+    dot.className = "api-dot checking";
+    txt.textContent = "Checking API...";
+    try {
+      const resp = await fetch(apiUrl("/agents"), { method: "GET", signal: AbortSignal.timeout(5000) });
+      if (resp.ok) {
+        API_ONLINE = true;
+        dot.className = "api-dot online";
+        txt.textContent = "API Connected";
+      } else {
+        API_ONLINE = false;
+        dot.className = "api-dot offline";
+        txt.textContent = "API Error";
+      }
+    } catch (e) {
+      API_ONLINE = false;
+      dot.className = "api-dot offline";
+      txt.textContent = "API Offline";
+    }
+  }
+
+  function pollForAnswer(requestId, callback) {
+    const startTime = Date.now();
+    const timerId = setInterval(async function() {
+      if (Date.now() - startTime > POLL_MAX) {
+        clearInterval(timerId);
+        callback(null, "Timed out waiting for agent response");
+        return;
+      }
+      try {
+        const res = await apiGet("/requests/" + requestId + "/status");
+        if (res.success && res.data.has_response) {
+          clearInterval(timerId);
+          callback(true, null);
+        }
+      } catch (e) {
+        // keep polling
+      }
+    }, POLL_INTERVAL);
+    pollTimers[requestId] = timerId;
+  }
+
+  function showToast(msg, type) {
+    const el = document.createElement("div");
+    el.className = "toast toast-" + (type || "success");
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(function() { el.remove(); }, 3500);
+  }
+
+  function renderAnswerCard(container, data, label) {
+    if (!data || data.status === "error" || data.status === "missing" || data.status === "failed") {
+      container.innerHTML = '<div class="card"><span class="badge badge-error">' + (data ? data.status : "error") + '</span> ' +
+        (data && data.error ? data.error : "No response received") + '</div>';
+      return;
+    }
+    const output = data.output || data;
+    const ansMd = output.answer_markdown || output.summary_markdown || JSON.stringify(output, null, 2);
+    const confidence = output.confidence != null ? (output.confidence * 100).toFixed(0) + "%" : "-";
+    const agentId = output.agent_id || data.agent_id || label || "";
+    container.innerHTML = '<div class="card">' +
+      '<div class="card-header">Answer</div>' +
+      '<div class="qa-answer">' + ansMd + '</div>' +
+      '<div class="qa-meta">Agent: ' + agentId + ' | Confidence: ' + confidence + '</div>' +
+      '</div>';
+  }
+
+  // ── Navigation ─────────────────────────────────────────────────────────
+  document.querySelectorAll(".nav-item").forEach(function(item) {
+    item.addEventListener("click", function() {
+      document.querySelectorAll(".nav-item").forEach(function(n) { n.classList.remove("active"); });
+      document.querySelectorAll(".panel").forEach(function(p) { p.classList.remove("active"); });
+      this.classList.add("active");
+      document.getElementById("panel-" + this.dataset.panel).classList.add("active");
+    });
+  });
+
+  // ── API Base URL config ────────────────────────────────────────────────
+  document.getElementById("api-reconnect-btn").addEventListener("click", function() {
+    API_BASE = document.getElementById("api-base-input").value || "http://localhost:5001";
+    checkApiStatus();
+  });
+  document.getElementById("api-base-input").addEventListener("keydown", function(e) {
+    if (e.key === "Enter") { API_BASE = this.value || "http://localhost:5001"; checkApiStatus(); }
+  });
+
+  // ── Overview ───────────────────────────────────────────────────────────
+  document.getElementById("requirement-text").textContent = DATA.requirement || "No requirement specified";
+  var profiles = Array.isArray(DATA.profiles) ? DATA.profiles : [];
+  var timeline = Array.isArray(DATA.timeline) ? DATA.timeline : [];
+  var simActions = Array.isArray(DATA.simActions) ? DATA.simActions : [];
+  var triples = Array.isArray(DATA.graphSnapshot) ? DATA.graphSnapshot : (DATA.graphSnapshot && DATA.graphSnapshot.triples ? DATA.graphSnapshot.triples : []);
+
+  var statsHtml = [
+    { value: profiles.length, label: "Agents" },
+    { value: timeline.length, label: "Timeline Events" },
+    { value: triples.length, label: "Graph Triples" },
+    { value: simActions.length, label: "Sim Actions" }
+  ].map(function(s) { return '<div class="stat"><div class="stat-value">' + s.value + '</div><div class="stat-label">' + s.label + '</div></div>'; }).join("");
+  document.getElementById("overview-stats").innerHTML = statsHtml;
+
+  var v = DATA.verdict || {};
+  var verdictBadge = v.status === "ok" ? "badge-ok" : (v.status === "mock" ? "badge-warn" : "badge-error");
+  document.getElementById("verdict-display").innerHTML =
+    '<span class="badge ' + verdictBadge + '">' + (v.status || "unknown") + '</span>' +
+    (v.confidence ? ' <span style="color:var(--text2);font-size:13px;">Confidence: ' + (v.confidence * 100).toFixed(0) + '%</span>' : '') +
+    '<pre style="margin-top:12px;">' + JSON.stringify(v, null, 2) + '</pre>';
+
+  // ── Report ─────────────────────────────────────────────────────────────
+  function mdToHtml(md) {
+    return md
+      .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+      .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+      .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g, '<em>$1</em>')
+      .replace(/`(.+?)`/g, '<code>$1</code>')
+      .replace(/^- (.+)$/gm, '<li>$1</li>')
+      .replace(/\n\n/g, '</p><p>')
+      .replace(/\n/g, '<br>');
+  }
+  document.getElementById("report-content").innerHTML = '<p>' + mdToHtml(DATA.reportMd) + '</p>';
+
+  // ── Agents ─────────────────────────────────────────────────────────────
+  if (profiles.length === 0) {
+    document.getElementById("agents-list").innerHTML = '<div class="empty-state">No agent profiles generated yet.</div>';
+  } else {
+    document.getElementById("agents-list").innerHTML = profiles.map(function(p) {
+      var aid = p.agent_id || p.user_id || "unknown";
+      return '<div class="agent-card"><div class="agent-name">' + (p.name || aid) + '</div>' +
+        '<div class="agent-id">' + aid + '</div>' +
+        (p.persona ? '<div class="agent-persona">' + p.persona + '</div>' : '') +
+        '<pre style="margin-top:8px;">' + JSON.stringify(p, null, 2) + '</pre></div>';
+    }).join("");
+  }
+
+  // ── Timeline ───────────────────────────────────────────────────────────
+  if (timeline.length === 0) {
+    document.getElementById("timeline-list").innerHTML = '<div class="empty-state">No timeline events.</div>';
+  } else {
+    document.getElementById("timeline-list").innerHTML = timeline.map(function(t, i) {
+      return '<div class="timeline-item"><div class="timeline-round">R' + (t.round || i + 1) + '</div>' +
+        '<div class="timeline-detail">' + (t.summary || t.fact || JSON.stringify(t)) + '</div></div>';
+    }).join("");
+  }
+
+  // ── Graph ──────────────────────────────────────────────────────────────
+  var entities = new Set();
+  triples.forEach(function(t) { if(t.subject) entities.add(t.subject); if(t.object) entities.add(t.object); });
+  document.getElementById("graph-stats").innerHTML =
+    '<div class="stat"><div class="stat-value">' + entities.size + '</div><div class="stat-label">Entities</div></div>' +
+    '<div class="stat"><div class="stat-value">' + triples.length + '</div><div class="stat-label">Triples</div></div>';
+  document.getElementById("graph-entities").innerHTML = Array.from(entities).map(function(e) {
+    return '<span class="graph-entity">' + e + '</span>';
+  }).join("") || '<div class="empty-state">No entities.</div>';
+  if (triples.length === 0) {
+    document.getElementById("graph-triples").innerHTML = '<div class="empty-state">No triples.</div>';
+  } else {
+    document.getElementById("graph-triples").innerHTML = triples.slice(0, 50).map(function(t) {
+      return '<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;">' +
+        '<span style="color:var(--accent);">' + (t.subject||'') + '</span> ' +
+        '<span style="color:var(--text2);">[' + (t.predicate||'') + ']</span> ' +
+        '<span style="color:var(--success);">' + (t.object||'') + '</span>' +
+        (t.confidence ? ' <span class="badge badge-ok">' + (t.confidence*100).toFixed(0) + '%</span>' : '') +
+        '</div>';
+    }).join("");
+  }
+
+  // ── Simulation ─────────────────────────────────────────────────────────
+  var cfg = DATA.simConfig || {};
+  document.getElementById("sim-stats").innerHTML =
+    '<div class="stat"><div class="stat-value">' + (cfg.rounds || cfg.simulation_rounds || 0) + '</div><div class="stat-label">Rounds</div></div>' +
+    '<div class="stat"><div class="stat-value">' + (cfg.round_unit || '-') + '</div><div class="stat-label">Round Unit</div></div>' +
+    '<div class="stat"><div class="stat-value">' + simActions.length + '</div><div class="stat-label">Actions</div></div>';
+  if (simActions.length === 0) {
+    document.getElementById("sim-actions").innerHTML = '<div class="empty-state">No simulation actions.</div>';
+  } else {
+    document.getElementById("sim-actions").innerHTML = simActions.slice(0, 100).map(function(a) {
+      return '<div class="action-item"><span class="action-agent">' + (a.agent_id||'') + '</span> ' +
+        '<span class="action-type">' + (a.action_type||'') + '</span><br>' +
+        '<span style="color:var(--text);">' + (a.content||'') + '</span></div>';
+    }).join("");
+  }
+
+  // ── Ask Agent (Interactive) ────────────────────────────────────────────
+  var agentSelect = document.getElementById("ask-agent-select");
+  var askSubmitBtn = document.getElementById("ask-submit-btn");
+  var askQuestionInput = document.getElementById("ask-question-input");
+  var askResultDiv = document.getElementById("ask-result");
+  var askStatusSpan = document.getElementById("ask-status");
+
+  profiles.forEach(function(p) {
+    var aid = p.agent_id || p.user_id || "unknown";
+    var opt = document.createElement("option");
+    opt.value = aid;
+    opt.textContent = (p.name || aid) + " (" + aid + ")";
+    agentSelect.appendChild(opt);
+  });
+
+  agentSelect.addEventListener("change", function() {
+    askSubmitBtn.disabled = !this.value || !askQuestionInput.value.trim();
+  });
+  askQuestionInput.addEventListener("input", function() {
+    askSubmitBtn.disabled = !agentSelect.value || !this.value.trim();
+  });
+
+  askSubmitBtn.addEventListener("click", async function() {
+    var agentId = agentSelect.value;
+    var question = askQuestionInput.value.trim();
+    if (!agentId || !question) return;
+    if (!API_ONLINE) { showToast("API is offline. Start the backend server first.", "error"); return; }
+
+    askSubmitBtn.disabled = true;
+    askStatusSpan.innerHTML = '<span class="spinner"></span> Submitting...';
+    askResultDiv.innerHTML = "";
+
+    try {
+      var res = await apiPost("/agents/" + encodeURIComponent(agentId) + "/ask", { question: question, limit: 20 });
+      var data = res.data || {};
+      var requestId = data.request_id;
+      if (!requestId) {
+        askStatusSpan.textContent = "";
+        renderAnswerCard(askResultDiv, data, agentId);
+        askSubmitBtn.disabled = false;
+        return;
+      }
+      askStatusSpan.innerHTML = '<span class="spinner"></span> Waiting for agent response...';
+      askResultDiv.innerHTML = '<div class="card"><span class="badge badge-pending">pending</span> Request ' + requestId + ' submitted. Polling for response...</div>';
+
+      pollForAnswer(requestId, async function(ok, err) {
+        if (!ok) {
+          askStatusSpan.textContent = "";
+          askResultDiv.innerHTML = '<div class="card"><span class="badge badge-error">timeout</span> ' + (err || "No response received") + '</div>';
+          askSubmitBtn.disabled = false;
+          return;
+        }
+        try {
+          var ansRes = await apiPost("/agents/answer/" + encodeURIComponent(requestId), {});
+          askStatusSpan.textContent = "";
+          renderAnswerCard(askResultDiv, ansRes.data, agentId);
+          showToast("Agent answered your question!");
+        } catch (e2) {
+          askStatusSpan.textContent = "";
+          askResultDiv.innerHTML = '<div class="card"><span class="badge badge-error">error</span> Failed to retrieve answer: ' + e2.message + '</div>';
+        }
+        askSubmitBtn.disabled = false;
+      });
+    } catch (e) {
+      askStatusSpan.textContent = "";
+      askResultDiv.innerHTML = '<div class="card"><span class="badge badge-error">error</span> ' + e.message + '</div>';
+      askSubmitBtn.disabled = false;
+    }
+  });
+
+  // ── Questionnaires (Interactive) ───────────────────────────────────────
+  var questionnaireQuestionsDiv = document.getElementById("questionnaire-questions");
+  var addQuestionBtn = document.getElementById("add-question-btn");
+  var questionnaireSubmitBtn = document.getElementById("questionnaire-submit-btn");
+  var questionnaireResultDiv = document.getElementById("questionnaire-result");
+  var questionnaireStatusSpan = document.getElementById("questionnaire-status");
+  var questionCounter = 1;
+
+  addQuestionBtn.addEventListener("click", function() {
+    questionCounter++;
+    var row = document.createElement("div");
+    row.className = "question-row";
+    row.dataset.qidx = questionCounter - 1;
+    row.innerHTML = '<input class="form-input" placeholder="Question ID (e.g. q' + questionCounter + ')" style="max-width:140px;" value="q' + questionCounter + '">' +
+      '<input class="form-input" placeholder="Question text..." style="flex:1;">' +
+      '<button class="btn btn-sm btn-secondary" onclick="removeQuestionRow(this)">Remove</button>';
+    questionnaireQuestionsDiv.appendChild(row);
+  });
+
+  window.removeQuestionRow = function(btn) {
+    var rows = questionnaireQuestionsDiv.querySelectorAll(".question-row");
+    if (rows.length <= 1) { showToast("Need at least one question", "error"); return; }
+    btn.closest(".question-row").remove();
+  };
+
+  questionnaireSubmitBtn.addEventListener("click", async function() {
+    if (!API_ONLINE) { showToast("API is offline. Start the backend server first.", "error"); return; }
+
+    var rows = questionnaireQuestionsDiv.querySelectorAll(".question-row");
+    var questions = [];
+    rows.forEach(function(row) {
+      var inputs = row.querySelectorAll("input");
+      var qid = inputs[0].value.trim();
+      var qtxt = inputs[1].value.trim();
+      if (qid && qtxt) questions.push({ question_id: qid, question: qtxt });
+    });
+    if (questions.length === 0) { showToast("Add at least one question with ID and text", "error"); return; }
+
+    questionnaireSubmitBtn.disabled = true;
+    questionnaireStatusSpan.innerHTML = '<span class="spinner"></span> Sending...';
+    questionnaireResultDiv.innerHTML = "";
+
+    try {
+      var res = await apiPost("/questionnaires", { questions: questions });
+      var data = res.data || {};
+      var questionnaireId = data.questionnaire_id;
+      if (!questionnaireId) {
+        questionnaireStatusSpan.textContent = "";
+        questionnaireResultDiv.innerHTML = '<div class="card">' + JSON.stringify(data, null, 2) + '</div>';
+        questionnaireSubmitBtn.disabled = false;
+        return;
+      }
+      questionnaireStatusSpan.innerHTML = '<span class="spinner"></span> Questionnaire ' + questionnaireId + ' sent. Waiting for agent responses...';
+      questionnaireResultDiv.innerHTML = '<div class="card"><span class="badge badge-pending">pending</span> Polling for responses...</div>';
+
+      // Poll for questionnaire completion
+      var startTime = Date.now();
+      var pollTimer = setInterval(async function() {
+        if (Date.now() - startTime > POLL_MAX) {
+          clearInterval(pollTimer);
+          questionnaireStatusSpan.textContent = "";
+          questionnaireResultDiv.innerHTML = '<div class="card"><span class="badge badge-warn">timeout</span> Questionnaire timed out. Some agents may not have responded.</div>';
+          questionnaireSubmitBtn.disabled = false;
+          return;
+        }
+        try {
+          var qRes = await apiGet("/questionnaires/" + encodeURIComponent(questionnaireId));
+          var qData = qRes.data || {};
+          var answers = qData.answers || [];
+          var totalExpected = profiles.length * questions.length;
+          if (answers.length >= totalExpected || (qData.status === "completed")) {
+            clearInterval(pollTimer);
+            questionnaireStatusSpan.textContent = "";
+            var summaryMd = qData.summary_markdown || "";
+            var answersHtml = answers.map(function(a) {
+              return '<div class="qa-item"><div class="qa-question">' + (a.question_id||"") + " — " + (a.agent_id||"") + '</div>' +
+                '<div class="qa-answer">' + (a.answer_markdown||"") + '</div>' +
+                '<div class="qa-meta">Confidence: ' + ((a.confidence||0)*100).toFixed(0) + '%</div></div>';
+            }).join("");
+            questionnaireResultDiv.innerHTML = '<div class="card"><div class="card-header">Results</div>' +
+              (summaryMd ? '<div class="qa-answer" style="margin-bottom:12px;">' + summaryMd + '</div>' : '') +
+              answersHtml + '</div>';
+            showToast("Questionnaire completed with " + answers.length + " answers!");
+          } else {
+            questionnaireStatusSpan.innerHTML = '<span class="spinner"></span> ' + answers.length + '/' + totalExpected + ' responses received...';
+          }
+        } catch (e) { /* keep polling */ }
+      }, POLL_INTERVAL);
+    } catch (e) {
+      questionnaireStatusSpan.textContent = "";
+      questionnaireResultDiv.innerHTML = '<div class="card"><span class="badge badge-error">error</span> ' + e.message + '</div>';
+    }
+    questionnaireSubmitBtn.disabled = false;
+  });
+
+  // ── Report Q&A (Interactive) ──────────────────────────────────────────
+  var reportQInput = document.getElementById("report-q-input");
+  var reportQSubmitBtn = document.getElementById("report-q-submit-btn");
+  var reportQResultDiv = document.getElementById("report-q-result");
+  var reportQStatusSpan = document.getElementById("report-q-status");
+
+  reportQSubmitBtn.addEventListener("click", async function() {
+    var question = reportQInput.value.trim();
+    if (!question) return;
+    if (!API_ONLINE) { showToast("API is offline. Start the backend server first.", "error"); return; }
+
+    reportQSubmitBtn.disabled = true;
+    reportQStatusSpan.innerHTML = '<span class="spinner"></span> Submitting...';
+    reportQResultDiv.innerHTML = "";
+
+    try {
+      var res = await apiPost("/report-questions", { question: question, limit: 20 });
+      var data = res.data || {};
+      var requestId = data.request_id;
+      if (!requestId) {
+        reportQStatusSpan.textContent = "";
+        renderAnswerCard(reportQResultDiv, data, "report");
+        reportQSubmitBtn.disabled = false;
+        return;
+      }
+      reportQStatusSpan.innerHTML = '<span class="spinner"></span> Waiting for response...';
+      reportQResultDiv.innerHTML = '<div class="card"><span class="badge badge-pending">pending</span> Request ' + requestId + ' submitted. Polling...</div>';
+
+      pollForAnswer(requestId, async function(ok, err) {
+        if (!ok) {
+          reportQStatusSpan.textContent = "";
+          reportQResultDiv.innerHTML = '<div class="card"><span class="badge badge-error">timeout</span> ' + (err || "No response received") + '</div>';
+          reportQSubmitBtn.disabled = false;
+          return;
+        }
+        try {
+          var ansRes = await apiPost("/report-questions/answer/" + encodeURIComponent(requestId), {});
+          reportQStatusSpan.textContent = "";
+          renderAnswerCard(reportQResultDiv, ansRes.data, "report");
+          showToast("Report question answered!");
+        } catch (e2) {
+          reportQStatusSpan.textContent = "";
+          reportQResultDiv.innerHTML = '<div class="card"><span class="badge badge-error">error</span> Failed to retrieve answer: ' + e2.message + '</div>';
+        }
+        reportQSubmitBtn.disabled = false;
+      });
+    } catch (e) {
+      reportQStatusSpan.textContent = "";
+      reportQResultDiv.innerHTML = '<div class="card"><span class="badge badge-error">error</span> ' + e.message + '</div>';
+      reportQSubmitBtn.disabled = false;
+    }
+  });
+
+  // ── History: render embedded Q&A and questionnaire data ────────────────
+  var aqs = DATA.agentQuestions || [];
+  var qs = DATA.questionnaires || [];
+
+  function renderStaticQA() {
+    var container = document.getElementById("ask-history");
+    if (aqs.length === 0) {
+      container.innerHTML = '<div class="empty-state" style="padding:24px;">No previous agent questions.</div>';
+    } else {
+      container.innerHTML = aqs.map(function(q) {
+        var ans = q.answer || {};
+        return '<div class="qa-item"><div class="qa-question">Q: ' + (q.question||'') + '</div>' +
+          '<div class="qa-answer">' + (ans.answer_markdown || '') + '</div>' +
+          '<div class="qa-meta">Agent: ' + (q.agent_id||'') + ' | Confidence: ' + ((ans.confidence||0)*100).toFixed(0) + '%</div></div>';
+      }).join("");
+    }
+  }
+
+  function renderStaticQuestionnaires() {
+    var container = document.getElementById("questionnaire-history");
+    if (qs.length === 0) {
+      container.innerHTML = '<div class="empty-state" style="padding:24px;">No previous questionnaires.</div>';
+    } else {
+      container.innerHTML = qs.map(function(q) {
+        var answers = q.answers || [];
+        var qhtml = answers.map(function(a) {
+          return '<div class="qa-item" style="margin-bottom:8px;"><div class="qa-question">' + (a.question_id||'') + ' — ' + (a.agent_id||'') + '</div>' +
+            '<div class="qa-answer">' + (a.answer_markdown||'') + '</div>' +
+            '<div class="qa-meta">Confidence: ' + ((a.confidence||0)*100).toFixed(0) + '%</div></div>';
+        }).join("");
+        return '<div class="card"><div class="card-header">Questionnaire: ' + (q.questionnaire_id||'') + '</div>' +
+          '<div style="font-size:13px;color:var(--text2);margin-bottom:12px;">Questions: ' + (q.questions||[]).length + ' | Answers: ' + answers.length + '</div>' +
+          (q.summary_markdown ? '<div class="qa-answer" style="margin-bottom:12px;">' + q.summary_markdown + '</div>' : '') +
+          (qhtml || '<div class="empty-state">No answers yet.</div>') + '</div>';
+      }).join("");
+    }
+  }
+
+  function renderAllInteractions() {
+    var container = document.getElementById("all-interactions-list");
+    var html = "";
+    if (aqs.length > 0) {
+      html += "<h3>Agent Questions</h3>";
+      html += aqs.map(function(q) {
+        var ans = q.answer || {};
+        return '<div class="qa-item"><div class="qa-question">Q: ' + (q.question||'') + '</div>' +
+          '<div class="qa-answer">' + (ans.answer_markdown || '') + '</div>' +
+          '<div class="qa-meta">Agent: ' + (q.agent_id||'') + ' | Confidence: ' + ((ans.confidence||0)*100).toFixed(0) + '%</div></div>';
+      }).join("");
+    }
+    if (qs.length > 0) {
+      html += "<h3>Questionnaires</h3>";
+      html += qs.map(function(q) {
+        var answers = q.answers || [];
+        return '<div class="card"><div class="card-header">Questionnaire: ' + (q.questionnaire_id||'') + '</div>' +
+          '<div style="font-size:13px;color:var(--text2);margin-bottom:8px;">Questions: ' + (q.questions||[]).length + ' | Answers: ' + answers.length + '</div></div>';
+      }).join("");
+    }
+    if (!html) html = '<div class="empty-state">No interactions recorded yet.</div>';
+    container.innerHTML = html;
+  }
+
+  renderStaticQA();
+  renderStaticQuestionnaires();
+  renderAllInteractions();
+
+  // ── Raw Artifacts ──────────────────────────────────────────────────────
+  var rawArtifacts = {
+    "verdict.json": DATA.verdict,
+    "timeline.json": DATA.timeline,
+    "graph_snapshot.json": DATA.graphSnapshot,
+    "profiles.json": DATA.profiles,
+    "simulation_config.json": DATA.simConfig,
+    "simulation_actions.json": DATA.simActions,
+    "report.md": DATA.reportMd
+  };
+  var tabNames = Object.keys(rawArtifacts);
+  document.getElementById("raw-tabs").innerHTML = tabNames.map(function(name, i) {
+    return '<button class="tab-btn' + (i === 0 ? ' active' : '') + '" data-tab="' + name + '">' + name + '</button>';
+  }).join("");
+  function showRawTab(name) {
+    var val = rawArtifacts[name];
+    var content = typeof val === "string" ? val : JSON.stringify(val, null, 2);
+    document.getElementById("raw-content").innerHTML = '<pre>' + (content || '(empty)') + '</pre>';
+  }
+  showRawTab(tabNames[0]);
+  document.querySelectorAll("#raw-tabs .tab-btn").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      document.querySelectorAll("#raw-tabs .tab-btn").forEach(function(b) { b.classList.remove("active"); });
+      btn.classList.add("active");
+      showRawTab(btn.dataset.tab);
+    });
+  });
+
+  // ── Init ───────────────────────────────────────────────────────────────
+  checkApiStatus();
+})();
+</script>
+</body>
+</html>"""

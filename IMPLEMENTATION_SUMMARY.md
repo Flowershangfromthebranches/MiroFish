@@ -15,6 +15,12 @@
 - Extended `GraphitiCompatibilityStore` Neo4j mode so episodes, agent memory, snapshot export/import, and timeline data stay in the Neo4j-backed compatibility layer instead of falling back to file storage.
 - Aligned `GraphitiCompatibilityStore` default behavior with production `doctor`: `MIROFISH_GRAPHITI_STORE=auto` uses Neo4j, and offline file storage requires explicit `MIROFISH_GRAPHITI_STORE=file`.
 - Added CLI and MCP follow-up Q&A through `answer_followup_question`, with GraphProvider retrieval context and queue-validated responses.
+- Added Web Console generation (`generate_web_console`) producing an interactive HTML page at `runs/<run_id>/artifacts/web/index.html` with embedded artifact data, agent Q&A forms, questionnaire builder, report question input, and API-driven polling. The console gracefully degrades to static data when the Flask backend is offline.
+- Added `backend/app/api/interaction.py` — Flask Blueprint providing REST endpoints for the Web Console: agent listing, agent Q&A, questionnaire submission, report questions, request polling, response submission, and artifact retrieval. All LLM work routes through `AgentRuntime / agent_queue`.
+- Added interaction task types: `answer_agent_question`, `answer_agent_questionnaire`, `summarize_questionnaire`, `ask_report_question` with matching output schemas and mock provider coverage.
+- Added CLI commands: `agents list/show/ask/answer`, `questionnaire send/show`, `report-question ask/answer`, `web generate`.
+- Added MCP tools: `mirofish_generate_web_console`, `mirofish_list_agents`, `mirofish_get_agent`, `mirofish_ask_agent`, `mirofish_get_agent_answer`, `mirofish_send_questionnaire`, `mirofish_get_questionnaire_result`, `mirofish_ask_report_question`, `mirofish_get_report_question_answer`.
+- Interaction artifacts are persisted to `runs/<run_id>/artifacts/interactions/agent_questions/`, `interactions/questionnaires/`, and `interactions/report_questions/`.
 - Added staged workflow support alongside the existing auto workflow. Staged runs pause after `seed_input`, `prediction_requirement`, `simulation_settings`, `graph_build`, `profile_and_config`, and `simulation_run` until the user approves, rejects, updates settings, or reruns a stage.
 - Added hard simulation settings to CLI/MCP run creation: `rounds`, `round_unit`, `minutes_per_round`, `pause_each_round`, `agent_count`, and `simulation_name`. `rounds` is persisted in `state.json` and no longer depends on natural-language requirement parsing.
 - Added staged CLI commands under `mirofish-agent stage ...` and matching MCP tools for current-stage inspection, settings updates, stage approval/rejection, and reruns.
@@ -105,7 +111,12 @@ Implemented full CLI/MCP lifecycle for:
 - batched simulation action request
 - report request
 - follow-up Q&A request
+- agent question request
+- agent questionnaire request
+- questionnaire summary request
+- report question request
 - `report.md`, `verdict.json`, `timeline.json`, `graph_snapshot.json`
+- interactive Web Console at `artifacts/web/index.html`
 
 Staged workflow maps to the original UI-style process:
 
@@ -134,7 +145,7 @@ Latest local verification:
 
 ```bash
 cd /Users/leaf/Documents/future/MiroFish/backend && uv run pytest -q
-# 46 passed, 414 warnings
+# 87 passed, 639 warnings
 
 cd /Users/leaf/Documents/future/MiroFish && bash scripts/smoke_agent_queue_full.sh
 # CLI full agent_queue smoke passed, including follow-up Q&A

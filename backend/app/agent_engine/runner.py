@@ -83,6 +83,32 @@ def _resolve_agent_id(profile: Dict[str, Any], index: int = 0) -> str:
     return f"agent_{index + 1}"
 
 
+def _resolve_all_agent_ids(profiles: list) -> List[str]:
+    """Resolve agent IDs for a full list of profiles with deduplication.
+
+    Same base logic as _resolve_agent_id, but when two profiles produce
+    the same ID the later ones get a ``_2``, ``_3``, … suffix so every
+    ID in the returned list is unique.
+    """
+    resolved: List[str] = []
+    seen: Dict[str, int] = {}
+    for i, profile in enumerate(profiles):
+        base_id = _resolve_agent_id(profile, i)
+        if base_id in seen:
+            seen[base_id] += 1
+            unique_id = f"{base_id}_{seen[base_id]}"
+            # Edge case: the suffixed ID might itself collide
+            while unique_id in seen:
+                seen[base_id] += 1
+                unique_id = f"{base_id}_{seen[base_id]}"
+            resolved.append(unique_id)
+            seen[unique_id] = 1
+        else:
+            resolved.append(base_id)
+            seen[base_id] = 1
+    return resolved
+
+
 class PredictionRunService:
     def __init__(
         self,
@@ -540,9 +566,10 @@ class PredictionRunService:
         if not profiles_path.exists():
             return {"status": "ok", "agents": [], "count": 0}
         profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+        resolved_ids = _resolve_all_agent_ids(profiles)
         agents = []
         for idx, profile in enumerate(profiles):
-            agent_id = _resolve_agent_id(profile, idx)
+            agent_id = resolved_ids[idx]
             agents.append({
                 "agent_id": agent_id,
                 "name": profile.get("name", ""),
@@ -557,8 +584,9 @@ class PredictionRunService:
         if not profiles_path.exists():
             return {"status": "error", "error": "profiles.json not found"}
         profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+        resolved_ids = _resolve_all_agent_ids(profiles)
         for idx, profile in enumerate(profiles):
-            pid = _resolve_agent_id(profile, idx)
+            pid = resolved_ids[idx]
             if pid == agent_id:
                 return {"status": "ok", "agent": {
                     "agent_id": pid,
@@ -641,8 +669,9 @@ class PredictionRunService:
         if not profiles_path.exists():
             return {"status": "error", "error": "profiles.json not found; cannot send questionnaire"}
         profiles = json.loads(profiles_path.read_text(encoding="utf-8"))
+        resolved_ids = _resolve_all_agent_ids(profiles)
         agents = [
-            {"agent_id": _resolve_agent_id(p, i), "profile": p}
+            {"agent_id": resolved_ids[i], "profile": p}
             for i, p in enumerate(profiles)
         ]
         questionnaire_id = f"questionnaire_{uuid.uuid4().hex[:8]}"
@@ -1475,6 +1504,7 @@ class PredictionRunService:
         settings = self._ensure_state_simulation_settings(state, store)
         agent_limit = int(settings.get("agent_count") or min(len(profiles), 5) or 1)
         selected_profiles = profiles[:agent_limit]
+        selected_ids = _resolve_all_agent_ids(selected_profiles)
         round_id = f"round_{round_index}"
         return {
             "round_id": round_id,
@@ -1482,7 +1512,7 @@ class PredictionRunService:
             "simulation_settings": settings,
             "actions": [
                 {
-                    "agent_id": _resolve_agent_id(profile, index),
+                    "agent_id": selected_ids[index],
                     "action_id": f"{round_id}_action_{index + 1}",
                     "round_id": round_id,
                 }
@@ -1604,7 +1634,7 @@ class PredictionRunService:
         profiles = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
         return {
             "profile_count": len(profiles),
-            "agent_ids": [_resolve_agent_id(profile, i) for i, profile in enumerate(profiles)],
+            "agent_ids": _resolve_all_agent_ids(profiles),
         }
 
     def _config_summary(self, store: RunStore, state) -> Dict[str, Any]:
@@ -1873,9 +1903,10 @@ class PredictionRunService:
         profiles = artifacts.get("profiles.json", [])
         # Normalize profile IDs before embedding (mirrors JS _resolveId logic)
         if isinstance(profiles, list):
+            _resolved = _resolve_all_agent_ids(profiles)
             for _pi, _pp in enumerate(profiles):
-                if isinstance(_pp, dict) and not _pp.get("agent_id"):
-                    _pp["agent_id"] = _resolve_agent_id(_pp, _pi)
+                if isinstance(_pp, dict):
+                    _pp["agent_id"] = _resolved[_pi]
         sim_config = artifacts.get("simulation_config.json", {})
         sim_actions = artifacts.get("simulation_actions.json", [])
         agent_questions = interactions.get("agent_questions", [])
@@ -2211,9 +2242,21 @@ pre { background:var(--surface2); border:1px solid var(--border); border-radius:
   }
   function _posFallback(idx) { return "agent_" + ((idx || 0) + 1); }
 
-  // Normalize embedded profiles so each has a guaranteed agent_id
+  // Normalize embedded profiles so each has a guaranteed unique agent_id
   var _profiles = Array.isArray(DATA.profiles) ? DATA.profiles : [];
-  _profiles.forEach(function(p, i) { if (!p.agent_id) p.agent_id = _resolveId(p, i); });
+  var _seenIds = {};
+  _profiles.forEach(function(p, i) {
+    if (!p.agent_id) p.agent_id = _resolveId(p, i);
+    if (_seenIds[p.agent_id]) {
+      _seenIds[p.agent_id]++;
+      var newId = p.agent_id + "_" + _seenIds[p.agent_id];
+      while (_seenIds[newId]) { _seenIds[p.agent_id]++; newId = p.agent_id + "_" + _seenIds[p.agent_id]; }
+      p.agent_id = newId;
+      _seenIds[newId] = 1;
+    } else {
+      _seenIds[p.agent_id] = 1;
+    }
+  });
 
   // ── API Client ─────────────────────────────────────────────────────────
   let API_BASE = "http://localhost:5001";

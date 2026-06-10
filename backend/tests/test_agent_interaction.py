@@ -17,7 +17,7 @@ from app.agent_engine.contracts import (
 )
 from app.agent_engine.json_schema import validate_json_schema
 from app.agent_engine.queue import AgentQueue
-from app.agent_engine.runner import PredictionRunService, _resolve_agent_id
+from app.agent_engine.runner import PredictionRunService, _resolve_agent_id, _resolve_all_agent_ids
 from app.agent_engine.schemas import AGENT_TASK_TYPES
 from app.agent_engine.state import RunStore
 
@@ -712,6 +712,46 @@ class TestResolveAgentId:
         assert _resolve_agent_id({"agent_id": "  x  "}, 0) == "x"
 
 
+class TestResolveAllAgentIds:
+    def test_no_duplicates_passthrough(self):
+        profiles = [{"name": "Alpha"}, {"name": "Beta"}]
+        ids = _resolve_all_agent_ids(profiles)
+        assert ids == ["alpha", "beta"]
+
+    def test_duplicate_names_get_suffix(self):
+        profiles = [
+            {"name": "Baidu"},
+            {"name": "Google China"},
+            {"name": "Baidu"},
+            {"type": "anon"},
+        ]
+        ids = _resolve_all_agent_ids(profiles)
+        assert ids[0] == "baidu"
+        assert ids[1] == "google_china"
+        assert ids[2] == "baidu_2"
+        assert ids[3] == "agent_4"
+        # All unique
+        assert len(set(ids)) == len(ids)
+
+    def test_triple_duplicate(self):
+        profiles = [{"name": "X"}, {"name": "X"}, {"name": "X"}]
+        ids = _resolve_all_agent_ids(profiles)
+        assert ids == ["x", "x_2", "x_3"]
+
+    def test_explicit_agent_id_collision(self):
+        profiles = [
+            {"agent_id": "agent_1"},
+            {"agent_id": "agent_1"},
+        ]
+        ids = _resolve_all_agent_ids(profiles)
+        assert ids[0] == "agent_1"
+        assert ids[1] == "agent_1_2"
+        assert len(set(ids)) == 2
+
+    def test_empty_list(self):
+        assert _resolve_all_agent_ids([]) == []
+
+
 class TestListAgentsFallbackId:
     def test_list_agents_returns_stable_ids_without_agent_id(self, tmp_path):
         run_dir, service = _init_run_no_agent_id(tmp_path)
@@ -721,10 +761,12 @@ class TestListAgentsFallbackId:
         ids = [a["agent_id"] for a in result["agents"]]
         assert ids[0] == "baidu"
         assert ids[1] == "google_china"
-        # Third profile also named "Baidu" — gets same slug
-        assert ids[2] == "baidu"
+        # Third profile also named "Baidu" — deduplicated with suffix
+        assert ids[2] == "baidu_2"
         # Fourth profile has no name — positional fallback
         assert ids[3] == "agent_4"
+        # All IDs must be unique
+        assert len(set(ids)) == len(ids), "agent_ids must be unique"
         # None should be empty or "unknown"
         assert all(aid for aid in ids), "No agent_id should be empty"
         assert "unknown" not in ids
@@ -735,6 +777,15 @@ class TestListAgentsFallbackId:
         assert result["status"] == "ok"
         assert result["agent"]["agent_id"] == "google_china"
         assert result["agent"]["name"] == "Google China"
+
+    def test_get_agent_finds_second_duplicate(self, tmp_path):
+        run_dir, service = _init_run_no_agent_id(tmp_path)
+        # First "Baidu" → "baidu", second "Baidu" → "baidu_2"
+        result = service.get_agent(str(run_dir), "baidu_2")
+        assert result["status"] == "ok"
+        assert result["agent"]["agent_id"] == "baidu_2"
+        assert result["agent"]["name"] == "Baidu"
+        assert result["agent"]["profile"]["type"] == "ai"
 
 
 class TestAskAgentFallbackId:
@@ -772,3 +823,14 @@ class TestWebConsoleFallbackId:
         html_content = html_path.read_text(encoding="utf-8")
         # The embedded profiles JSON should contain the slug IDs
         assert '"agent_id"' not in html_content or '"baidu"' in html_content or '"google_china"' in html_content
+
+    def test_web_console_duplicate_names_get_unique_ids(self, tmp_path):
+        """Embedded profiles with duplicate names must have unique agent_ids."""
+        run_dir, service = _init_run_no_agent_id(tmp_path)
+        service.generate_web_console(str(run_dir))
+        html_path = run_dir / "artifacts" / "web" / "index.html"
+        html_content = html_path.read_text(encoding="utf-8")
+        # The second "Baidu" profile should get "baidu_2"
+        assert "baidu_2" in html_content
+        # The fourth profile (no name) should get "agent_4"
+        assert "agent_4" in html_content
